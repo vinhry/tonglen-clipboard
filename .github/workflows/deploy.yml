@@ -1,0 +1,54 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        run: bun run build
+
+      - name: Deploy
+        env:
+          APP_NAME: ${{ vars.APP_NAME }}
+          PORT: ${{ vars.PORT }}
+          DISCOVERY_PORT: ${{ vars.DISCOVERY_PORT }}
+          DEPLOY_BASE: /var/www/${{ github.event.repository.name }}
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          RELEASE_DIR="${DEPLOY_BASE}/releases/${TIMESTAMP}"
+
+          # Create release directory
+          sudo mkdir -p "${RELEASE_DIR}"
+          sudo mkdir -p "${DEPLOY_BASE}/logs"
+
+          # Copy build artifacts and config
+          sudo cp -r bin "${RELEASE_DIR}/"
+          sudo cp pm2.config.cjs "${RELEASE_DIR}/"
+          sudo cp .env.example "${RELEASE_DIR}/.env"
+          sudo chmod +x "${RELEASE_DIR}/bin/app"
+
+          # Update current symlink
+          sudo ln -sfn "${RELEASE_DIR}" "${DEPLOY_BASE}/current"
+
+          # Restart app with PM2
+          cd "${DEPLOY_BASE}/current"
+          pm2 startOrRestart pm2.config.cjs --env production
+          pm2 save
+
+          # Clean up old releases (keep last 5)
+          cd "${DEPLOY_BASE}/releases"
+          ls -dt */ | tail -n +6 | xargs -r sudo rm -rf
