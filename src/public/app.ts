@@ -720,6 +720,19 @@ function init() {
   // Connect WebSocket
   connect();
 
+  // Set favicon dynamically (avoids Bun HTML bundler resolving the path)
+  const faviconLink = document.createElement("link");
+  faviconLink.rel = "icon";
+  faviconLink.type = "image/svg+xml";
+  faviconLink.href = "/favicon.svg";
+  document.head.appendChild(faviconLink);
+
+  // Set logo images dynamically
+  const logoJoin = document.getElementById("logo-join") as HTMLImageElement | null;
+  const logoHeader = document.getElementById("logo-header") as HTMLImageElement | null;
+  if (logoJoin) logoJoin.src = "/favicon.svg";
+  if (logoHeader) logoHeader.src = "/favicon.svg";
+
   // Initialize lucide icons
   createIcons({ icons, nameAttr: "data-lucide" });
 }

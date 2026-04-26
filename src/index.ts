@@ -32,6 +32,13 @@ const server = Bun.serve<WsData>({
   async fetch(req, server) {
     const url = new URL(req.url);
 
+    // Serve favicon
+    if (url.pathname === "/favicon.svg") {
+      return new Response(Bun.file(import.meta.dir + "/../logo/tonglen-clipboard-mark.svg"), {
+        headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400" },
+      });
+    }
+
     // Upgrade WebSocket requests
     if (url.pathname === "/ws") {
       const peerId = crypto.randomUUID();
