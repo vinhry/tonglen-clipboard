@@ -4,6 +4,7 @@
 
 <p align="center">
   Share clipboard text and files across devices on your local network — real-time, room-based, zero setup. Built with **Bun**, **TypeScript**, and **TailwindCSS**.
+</p>
 
 ## Features
 
