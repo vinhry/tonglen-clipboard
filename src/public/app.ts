@@ -727,6 +727,18 @@ function init() {
   faviconLink.href = "/favicon.svg";
   document.head.appendChild(faviconLink);
 
+  // Apple touch icon (injected dynamically to avoid bundler resolving the file)
+  const appleTouchIcon = document.createElement("link");
+  appleTouchIcon.rel = "apple-touch-icon";
+  appleTouchIcon.href = "/apple-touch-icon.png";
+  document.head.appendChild(appleTouchIcon);
+
+  // Web app manifest (injected dynamically to avoid bundler resolving the file)
+  const manifestLink = document.createElement("link");
+  manifestLink.rel = "manifest";
+  manifestLink.href = "/manifest.json";
+  document.head.appendChild(manifestLink);
+
   // Set logo images dynamically
   const logoJoin = document.getElementById("logo-join") as HTMLImageElement | null;
   const logoHeader = document.getElementById("logo-header") as HTMLImageElement | null;
