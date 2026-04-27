@@ -6,6 +6,7 @@ import { createWebSocketHandlers } from "./server/websocket.ts";
 import { createRouter } from "./server/router.ts";
 import { startDiscovery, getLocalIP } from "./server/discovery.ts";
 import homepage from "./public/index.html";
+import manifest from "./public/manifest.json";
 
 const PORT = Number(process.env.PORT) || 7582;
 
@@ -36,6 +37,20 @@ const server = Bun.serve<WsData>({
     if (url.pathname === "/favicon.svg") {
       return new Response(Bun.file(import.meta.dir + "/../logo/tonglen-clipboard-mark.svg"), {
         headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400" },
+      });
+    }
+
+    // Serve apple-touch-icon for iOS Add to Home Screen
+    if (url.pathname === "/apple-touch-icon.png") {
+      return new Response(Bun.file(import.meta.dir + "/../logo/apple-touch-icon-180x180.png"), {
+        headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" },
+      });
+    }
+
+    // Serve web app manifest
+    if (url.pathname === "/manifest.json") {
+      return new Response(JSON.stringify(manifest), {
+        headers: { "Content-Type": "application/manifest+json", "Cache-Control": "public, max-age=86400" },
       });
     }
 
