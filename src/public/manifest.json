@@ -1,0 +1,16 @@
+{
+  "name": "Tonglen Clipboard",
+  "short_name": "Tonglen",
+  "description": "Share text and files across devices on your network",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#030712",
+  "theme_color": "#f59e0b",
+  "icons": [
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    }
+  ]
+}
