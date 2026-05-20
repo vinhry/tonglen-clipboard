@@ -33,7 +33,8 @@ const clipboardEntries: ClipboardEntry[] = [];
 const sharedFiles: FileInfo[] = [];
 
 // ── DOM Elements ─────────────────────────────────────────────
-const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+const $ = <T extends HTMLElement>(id: string) =>
+  document.getElementById(id) as T;
 
 const joinScreen = $<HTMLDivElement>("join-screen");
 const mainScreen = $<HTMLDivElement>("main-screen");
@@ -76,9 +77,14 @@ const settingsOwnerHint = $<HTMLElement>("settings-owner-hint");
 
 // ── Expiry helpers ────────────────────────────────────────────
 const EXPIRY_LABELS: Record<string, string> = {
-  "1": "1 minute", "5": "5 minutes", "15": "15 minutes",
-  "30": "30 minutes", "60": "1 hour", "360": "6 hours",
-  "720": "12 hours", "1440": "24 hours",
+  "1": "1 minute",
+  "5": "5 minutes",
+  "15": "15 minutes",
+  "30": "30 minutes",
+  "60": "1 hour",
+  "360": "6 hours",
+  "720": "12 hours",
+  "1440": "24 hours",
 };
 
 function updateExpiryUI(minutes: number) {
@@ -130,7 +136,11 @@ function generateRoomCode(): string {
 }
 
 function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return new Date(ts).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
 
 function formatSize(bytes: number): string {
@@ -168,7 +178,9 @@ function connect() {
     reconnectAttempts = 0;
     updateStatus(true);
     if (currentRoom && myName) {
-      ws!.send(JSON.stringify({ type: "join", room: currentRoom, name: myName }));
+      ws!.send(
+        JSON.stringify({ type: "join", room: currentRoom, name: myName }),
+      );
     }
   };
 
@@ -210,7 +222,8 @@ function handleMessage(msg: ServerMessage) {
     case "joined":
       myPeerId = msg.peerId as string;
       currentRoom = msg.room as string;
-      if (msg.fileExpiryMinutes) updateExpiryUI(msg.fileExpiryMinutes as number);
+      if (msg.fileExpiryMinutes)
+        updateExpiryUI(msg.fileExpiryMinutes as number);
       if (msg.maxUploadSizeMB) updateMaxUploadUI(msg.maxUploadSizeMB as number);
       isOwner = (msg.isOwner as boolean) ?? false;
       updateSettingsEnabled();
@@ -218,7 +231,8 @@ function handleMessage(msg: ServerMessage) {
       break;
 
     case "settings":
-      if (msg.fileExpiryMinutes) updateExpiryUI(msg.fileExpiryMinutes as number);
+      if (msg.fileExpiryMinutes)
+        updateExpiryUI(msg.fileExpiryMinutes as number);
       if (msg.maxUploadSizeMB) updateMaxUploadUI(msg.maxUploadSizeMB as number);
       break;
 
@@ -228,7 +242,9 @@ function handleMessage(msg: ServerMessage) {
       break;
 
     case "peers":
-      renderPeers(msg.peers as { id: string; name: string; isOwner: boolean }[]);
+      renderPeers(
+        msg.peers as { id: string; name: string; isOwner: boolean }[],
+      );
       break;
 
     case "clipboard": {
@@ -461,14 +477,24 @@ btnRandomRoom.addEventListener("click", () => {
 });
 
 btnJoin.addEventListener("click", joinRoom);
-inputName.addEventListener("keydown", (e) => { if (e.key === "Enter") joinRoom(); });
-inputRoom.addEventListener("keydown", (e) => { if (e.key === "Enter") joinRoom(); });
+inputName.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") joinRoom();
+});
+inputRoom.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") joinRoom();
+});
 
 function joinRoom() {
   const name = inputName.value.trim();
   const room = inputRoom.value.trim();
-  if (!name) { inputName.focus(); return; }
-  if (!room) { inputRoom.focus(); return; }
+  if (!name) {
+    inputName.focus();
+    return;
+  }
+  if (!room) {
+    inputRoom.focus();
+    return;
+  }
 
   myName = name;
   currentRoom = room;
@@ -501,7 +527,12 @@ function sendText() {
   if (!text) return;
   sendMsg({ type: "clipboard", text });
   // Add to local feed immediately
-  clipboardEntries.push({ text, from: myName, fromId: myPeerId, timestamp: Date.now() });
+  clipboardEntries.push({
+    text,
+    from: myName,
+    fromId: myPeerId,
+    timestamp: Date.now(),
+  });
   renderClipboardFeed();
   inputText.value = "";
   lastClipboardText = text;
@@ -511,11 +542,13 @@ function sendText() {
 btnCopyLink.addEventListener("click", () => {
   const url = `${location.origin}?room=${encodeURIComponent(currentRoom)}`;
   navigator.clipboard?.writeText(url).then(() => {
-    btnCopyLink.innerHTML = '<i data-lucide="check" class="h-3.5 w-3.5"></i> Copied!';
+    btnCopyLink.innerHTML =
+      '<i data-lucide="check" class="h-3.5 w-3.5"></i> Copied!';
     btnCopyLink.classList.add("text-emerald-400", "border-emerald-500");
     createIcons({ icons, nameAttr: "data-lucide" });
     setTimeout(() => {
-      btnCopyLink.innerHTML = '<i data-lucide="link" class="h-3.5 w-3.5"></i> Copy Link';
+      btnCopyLink.innerHTML =
+        '<i data-lucide="link" class="h-3.5 w-3.5"></i> Copy Link';
       btnCopyLink.classList.remove("text-emerald-400", "border-emerald-500");
       createIcons({ icons, nameAttr: "data-lucide" });
     }, 1500);
@@ -547,7 +580,12 @@ btnPaste.addEventListener("click", async () => {
     if (text && text.length > 0) {
       lastClipboardText = text;
       sendMsg({ type: "clipboard", text });
-      clipboardEntries.push({ text, from: myName, fromId: myPeerId, timestamp: Date.now() });
+      clipboardEntries.push({
+        text,
+        from: myName,
+        fromId: myPeerId,
+        timestamp: Date.now(),
+      });
       renderClipboardFeed();
       return;
     }
@@ -566,7 +604,12 @@ btnPaste.addEventListener("click", async () => {
   if (text && text.length > 0) {
     lastClipboardText = text;
     sendMsg({ type: "clipboard", text });
-    clipboardEntries.push({ text, from: myName, fromId: myPeerId, timestamp: Date.now() });
+    clipboardEntries.push({
+      text,
+      from: myName,
+      fromId: myPeerId,
+      timestamp: Date.now(),
+    });
     renderClipboardFeed();
   }
 });
@@ -575,14 +618,23 @@ btnPaste.addEventListener("click", async () => {
 document.addEventListener("paste", (e: ClipboardEvent) => {
   if (!watching) return;
   // Don't intercept paste when typing in any input or textarea
-  if (document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLTextAreaElement) return;
+  if (
+    document.activeElement instanceof HTMLInputElement ||
+    document.activeElement instanceof HTMLTextAreaElement
+  )
+    return;
 
   const text = e.clipboardData?.getData("text/plain");
   if (text && text !== lastClipboardText && text.length > 0) {
     e.preventDefault();
     lastClipboardText = text;
     sendMsg({ type: "clipboard", text });
-    clipboardEntries.push({ text, from: myName, fromId: myPeerId, timestamp: Date.now() });
+    clipboardEntries.push({
+      text,
+      from: myName,
+      fromId: myPeerId,
+      timestamp: Date.now(),
+    });
     renderClipboardFeed();
   }
 });
@@ -618,7 +670,9 @@ dropZone.addEventListener("drop", (e) => {
 async function uploadFile(file: File) {
   const maxBytes = Number(maxUploadSizeSelect.value) * 1024 * 1024;
   if (file.size > maxBytes) {
-    showAlert(`File "${file.name}" (${formatSize(file.size)}) exceeds the max upload size of ${formatSize(maxBytes)}.`);
+    showAlert(
+      `File "${file.name}" (${formatSize(file.size)}) exceeds the max upload size of ${formatSize(maxBytes)}.`,
+    );
     return;
   }
 
@@ -633,7 +687,10 @@ async function uploadFile(file: File) {
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `/api/upload/${encodeURIComponent(currentRoom)}`);
       xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
-      xhr.setRequestHeader("X-File-Mime", file.type || "application/octet-stream");
+      xhr.setRequestHeader(
+        "X-File-Mime",
+        file.type || "application/octet-stream",
+      );
       xhr.setRequestHeader("X-Uploader", myName);
 
       xhr.upload.onprogress = (e) => {
@@ -705,7 +762,8 @@ function init() {
   fetch("/api/info")
     .then((r) => r.json())
     .then((info: any) => {
-      serverInfo.textContent = `Port: ${info.port} · ${info.rooms} rooms · ${info.peers} peers`;
+      // serverInfo.textContent = `Port: ${info.port} · ${info.rooms} rooms · ${info.peers} peers`;
+      serverInfo.textContent = `${info.peers} peers`;
     })
     .catch(() => {});
 
@@ -740,8 +798,12 @@ function init() {
   document.head.appendChild(manifestLink);
 
   // Set logo images dynamically
-  const logoJoin = document.getElementById("logo-join") as HTMLImageElement | null;
-  const logoHeader = document.getElementById("logo-header") as HTMLImageElement | null;
+  const logoJoin = document.getElementById(
+    "logo-join",
+  ) as HTMLImageElement | null;
+  const logoHeader = document.getElementById(
+    "logo-header",
+  ) as HTMLImageElement | null;
   if (logoJoin) logoJoin.src = "/favicon.svg";
   if (logoHeader) logoHeader.src = "/favicon.svg";
 

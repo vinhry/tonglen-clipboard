@@ -6,7 +6,7 @@ module.exports = {
   apps: [
     {
       name: appName,
-      script: "./bin/app",
+      script: "./bin/tonglen-clipboard-app",
       cwd: `${deployBase}/current`,
       env: {
         PORT: 7582,
