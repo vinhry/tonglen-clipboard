@@ -3,7 +3,7 @@ import tailwind from "bun-plugin-tailwind";
 const result = await Bun.build({
   entrypoints: ["./src/index.ts"],
   compile: {
-    outfile: "./bin/app",
+    outfile: "./bin/tonglen-clipboard-app",
     execArgv: ["--smol"],
   },
   plugins: [tailwind],
