@@ -1,7 +1,7 @@
 import type { WsData } from "./lib/types.ts";
 import { RoomManager } from "./lib/room.ts";
 import { ClipboardHistory } from "./lib/history.ts";
-import { FileStore } from "./lib/file-store.ts";
+import { FileStore, toFileInfo } from "./lib/file-store.ts";
 import { createWebSocketHandlers } from "./server/websocket.ts";
 import { createRouter } from "./server/router.ts";
 import { startDiscovery, getLocalIP } from "./server/discovery.ts";
@@ -77,7 +77,7 @@ const server = Bun.serve<WsData>({
     open: wsHandlers.open,
     message: wsHandlers.message,
     close: wsHandlers.close,
-    maxPayloadLength: 16 * 1024, // 16KB for text-only WS messages
+    maxPayloadLength: 1_100_000, // fits the 1MB clipboard text limit plus JSON overhead
     idleTimeout: 120,
   },
 });
@@ -99,12 +99,7 @@ setInterval(() => {
       rooms.broadcastToRoom(roomId, {
         type: "cleanup",
         clipboardEntries: history.getHistory(roomId),
-        files: currentFiles.map((f) => ({
-          fileId: f.id,
-          fileName: f.name,
-          fileSize: f.size,
-          from: f.uploadedBy,
-        })),
+        files: currentFiles.map(toFileInfo),
       });
     }
   }

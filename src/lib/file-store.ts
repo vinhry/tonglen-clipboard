@@ -1,6 +1,6 @@
 import { mkdirSync, unlinkSync, readdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { FileEntry } from "./types.ts";
+import type { FileEntry, FileInfo } from "./types.ts";
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10GB
 const MIN_UPLOAD_SIZE = 1 * 1024 * 1024; // 1MB
@@ -12,6 +12,19 @@ const MIN_EXPIRY_MS = 60 * 1000; // 1 minute
 const MAX_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 const TEMP_DIR = resolve("temp");
+
+/** Public metadata for a stored file, as sent to clients. */
+export function toFileInfo(entry: Omit<FileEntry, "filePath">): FileInfo {
+  return {
+    fileId: entry.id,
+    fileName: entry.name,
+    fileSize: entry.size,
+    mime: entry.mime,
+    from: entry.uploadedBy,
+    fromId: entry.uploaderId,
+    timestamp: entry.uploadedAt,
+  };
+}
 
 export class FileStore {
   private files = new Map<string, FileEntry>();

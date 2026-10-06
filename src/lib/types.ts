@@ -43,6 +43,7 @@ export interface FileEntry {
   filePath: string;
   roomId: string;
   uploadedBy: string;
+  uploaderId: string;
   uploadedAt: number;
 }
 
@@ -94,12 +95,18 @@ export interface HistoryMessage {
   entries: ClipboardEntry[];
 }
 
-export interface FileBroadcast {
-  type: "file-notify";
+export interface FileInfo {
   fileId: string;
   fileName: string;
   fileSize: number;
+  mime: string;
   from: string;
+  fromId: string;
+  timestamp: number;
+}
+
+export interface FileBroadcast extends FileInfo {
+  type: "file-notify";
 }
 
 export interface ErrorMessage {
@@ -131,7 +138,7 @@ export interface OwnerMessage {
 export interface CleanupBroadcast {
   type: "cleanup";
   clipboardEntries: ClipboardEntry[];
-  files: { fileId: string; fileName: string; fileSize: number; from: string }[];
+  files: FileInfo[];
 }
 
 export type ServerMessage =
