@@ -18,19 +18,48 @@ interface FileInfo {
   fileId: string;
   fileName: string;
   fileSize: number;
+  mime: string;
   from: string;
+  fromId: string;
+  timestamp: number;
 }
+
+interface Peer {
+  id: string;
+  name: string;
+  isOwner: boolean;
+}
+
+type FeedItem =
+  | ({ kind: "text"; id: string } & ClipboardEntry)
+  | ({ kind: "file"; id: string } & FileInfo)
+  | { kind: "upload"; id: string; fileName: string; fileSize: number; pct: number; timestamp: number };
+
+// ── Constants ────────────────────────────────────────────────
+const GROUP_WINDOW_MS = 2 * 60_000;
+const MAX_WS_TEXT_BYTES = 900_000; // larger text is sent as a .txt file instead
+const INLINE_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const NAME_STORAGE_KEY = "tonglen:name";
 
 // ── State ────────────────────────────────────────────────────
 let ws: WebSocket | null = null;
+let online = false;
+let reconnectAttempts = 0;
+let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 let myPeerId = "";
+let uploadToken = "";
+// Peer ids change on every reconnect; remember all of ours so old items still read as "You"
+const myPeerIds = new Set<string>();
 let currentRoom = "";
 let myName = "";
-let reconnectAttempts = 0;
-let lastClipboardText = "";
 let isOwner = false;
-const clipboardEntries: ClipboardEntry[] = [];
-const sharedFiles: FileInfo[] = [];
+let watching = true;
+let feed: FeedItem[] = [];
+const uploads = new Map<string, XMLHttpRequest>();
+const expandedIds = new Set<string>();
+let localSeq = 0;
+let renderQueued = false;
+let stickToBottom = true;
 
 // ── DOM Elements ─────────────────────────────────────────────
 const $ = <T extends HTMLElement>(id: string) =>
@@ -44,6 +73,7 @@ const btnRandomRoom = $<HTMLButtonElement>("btn-random-room");
 const btnJoin = $<HTMLButtonElement>("btn-join");
 const serverInfo = $<HTMLDivElement>("server-info");
 const headerRoom = $<HTMLElement>("header-room");
+const btnRoomCode = $<HTMLButtonElement>("btn-room-code");
 const headerStatus = $<HTMLElement>("header-status");
 const headerPeersCount = $<HTMLElement>("header-peers-count");
 const btnCopyLink = $<HTMLButtonElement>("btn-copy-link");
@@ -51,29 +81,24 @@ const btnLeave = $<HTMLButtonElement>("btn-leave");
 const qrContainer = $<HTMLDivElement>("qr-container");
 const shareUrl = $<HTMLElement>("share-url");
 const peersList = $<HTMLUListElement>("peers-list");
-const clipboardFeed = $<HTMLDivElement>("clipboard-feed");
+const feedEl = $<HTMLDivElement>("feed");
 const toggleWatch = $<HTMLInputElement>("toggle-watch");
 const inputText = $<HTMLTextAreaElement>("input-text");
 const btnSend = $<HTMLButtonElement>("btn-send");
-const dropZone = $<HTMLDivElement>("drop-zone");
+const btnPaste = $<HTMLButtonElement>("btn-paste");
 const fileInput = $<HTMLInputElement>("file-input");
-const fileList = $<HTMLDivElement>("file-list");
-const uploadProgress = $<HTMLDivElement>("upload-progress");
-const uploadName = $<HTMLElement>("upload-name");
-const uploadPct = $<HTMLElement>("upload-pct");
-const uploadBar = $<HTMLDivElement>("upload-bar");
+const dropOverlay = $<HTMLDivElement>("drop-overlay");
+const sidebar = $<HTMLElement>("sidebar");
 const btnMobilePeers = $<HTMLButtonElement>("btn-mobile-peers");
-const mobileDrawer = $<HTMLDivElement>("mobile-drawer");
 const drawerBackdrop = $<HTMLDivElement>("drawer-backdrop");
 const btnCloseDrawer = $<HTMLButtonElement>("btn-close-drawer");
-const qrContainerMobile = $<HTMLDivElement>("qr-container-mobile");
-const shareUrlMobile = $<HTMLElement>("share-url-mobile");
-const peersListMobile = $<HTMLUListElement>("peers-list-mobile");
 const fileExpirySelect = $<HTMLSelectElement>("file-expiry");
 const expiryLabel = $<HTMLElement>("expiry-label");
 const maxUploadSizeSelect = $<HTMLSelectElement>("max-upload-size");
 const maxUploadLabel = $<HTMLElement>("max-upload-label");
 const settingsOwnerHint = $<HTMLElement>("settings-owner-hint");
+
+const refreshIcons = () => createIcons({ icons, nameAttr: "data-lucide" });
 
 // ── Expiry helpers ────────────────────────────────────────────
 const EXPIRY_LABELS: Record<string, string> = {
@@ -136,55 +161,132 @@ function generateRoomCode(): string {
 }
 
 function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
+  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatDay(ts: number): string {
+  const day = dayKey(ts);
+  if (day === dayKey(Date.now())) return "Today";
+  if (day === dayKey(Date.now() - 86_400_000)) return "Yesterday";
+  return new Date(ts).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+}
+
+function dayKey(ts: number): string {
+  return new Date(ts).toDateString();
 }
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return bytes + " B";
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
 }
 
 function escapeHtml(str: string): string {
-  const div = document.createElement("div");
-  div.textContent = str;
-  return div.innerHTML;
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
-function showAlert(message: string) {
-  const container = $("alert-container") as HTMLDivElement;
+/** Escape text and turn bare http(s) URLs into links. */
+function linkify(text: string): string {
+  const urlRe = /https?:\/\/[^\s<>"'`]+/g;
+  let out = "";
+  let last = 0;
+  for (const match of text.matchAll(urlRe)) {
+    // Leave trailing punctuation outside the link
+    const url = match[0].replace(/[.,;:!?)\]]+$/, "");
+    const start = match.index!;
+    out += escapeHtml(text.slice(last, start));
+    out += `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" class="text-amber-400 underline decoration-amber-400/40 underline-offset-2 hover:decoration-amber-400">${escapeHtml(url)}</a>`;
+    last = start + url.length;
+  }
+  return out + escapeHtml(text.slice(last));
+}
+
+function timestampSlug(d = new Date()): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function nextLocalId(prefix: string): string {
+  // crypto.randomUUID is unavailable on plain-http LAN origins, so use a counter
+  return `${prefix}-local-${++localSeq}`;
+}
+
+/** Copy text, falling back to execCommand on insecure (plain http) origins. */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to legacy path
+  }
+  const tmp = document.createElement("textarea");
+  tmp.value = text;
+  tmp.setAttribute("readonly", "");
+  tmp.style.position = "fixed";
+  tmp.style.opacity = "0";
+  document.body.appendChild(tmp);
+  tmp.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch {
+    ok = false;
+  }
+  tmp.remove();
+  return ok;
+}
+
+type ToastVariant = "error" | "success" | "info";
+
+const TOAST_STYLES: Record<ToastVariant, { cls: string; icon: string }> = {
+  error: { cls: "border-red-500/30 bg-red-950/80 text-red-300", icon: "triangle-alert" },
+  success: { cls: "border-emerald-500/30 bg-emerald-950/80 text-emerald-300", icon: "circle-check" },
+  info: { cls: "border-gray-700 bg-gray-900/90 text-gray-200", icon: "info" },
+};
+
+function showToast(message: string, variant: ToastVariant = "error") {
+  const container = $<HTMLDivElement>("alert-container");
+  const style = TOAST_STYLES[variant];
   const toast = document.createElement("div");
-  toast.className =
-    "flex items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-400 shadow-lg backdrop-blur transition-opacity duration-300";
-  toast.innerHTML = `<i data-lucide="alert-triangle" class="h-4 w-4 shrink-0"></i><span>${escapeHtml(message)}</span>`;
+  toast.setAttribute("role", variant === "error" ? "alert" : "status");
+  toast.className = `pointer-events-auto flex max-w-sm items-center gap-2 rounded-xl border px-4 py-3 text-sm shadow-lg backdrop-blur transition-opacity duration-300 ${style.cls}`;
+  toast.innerHTML = `<i data-lucide="${style.icon}" class="h-4 w-4 shrink-0"></i><span>${escapeHtml(message)}</span>`;
   container.appendChild(toast);
-  createIcons({ icons, nameAttr: "data-lucide" });
+  refreshIcons();
   setTimeout(() => {
     toast.classList.add("opacity-0");
     setTimeout(() => toast.remove(), 300);
-  }, 5000);
+  }, variant === "error" ? 5000 : 2500);
+}
+
+function shareLink(): string {
+  return `${location.origin}/?room=${encodeURIComponent(currentRoom)}`;
 }
 
 // ── WebSocket ────────────────────────────────────────────────
 function connect() {
+  clearTimeout(reconnectTimer);
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  const socket = new WebSocket(`${proto}//${location.host}/ws`);
+  ws = socket;
 
-  ws.onopen = () => {
+  socket.onopen = () => {
     reconnectAttempts = 0;
     updateStatus(true);
     if (currentRoom && myName) {
-      ws!.send(
-        JSON.stringify({ type: "join", room: currentRoom, name: myName }),
-      );
+      socket.send(JSON.stringify({ type: "join", room: currentRoom, name: myName }));
     }
   };
 
-  ws.onmessage = (ev) => {
+  socket.onmessage = (ev) => {
     let msg: ServerMessage;
     try {
       msg = JSON.parse(ev.data);
@@ -194,26 +296,53 @@ function connect() {
     handleMessage(msg);
   };
 
-  ws.onclose = () => {
+  socket.onclose = () => {
+    if (ws !== socket) return; // replaced by a newer connection
     updateStatus(false);
     scheduleReconnect();
   };
 
-  ws.onerror = () => {
-    ws?.close();
+  socket.onerror = () => {
+    socket.close();
   };
 }
 
 function scheduleReconnect() {
   reconnectAttempts++;
   const delay = Math.min(1000 * 2 ** reconnectAttempts, 30000);
-  setTimeout(connect, delay);
+  reconnectTimer = setTimeout(connect, delay);
 }
 
-function sendMsg(msg: object) {
+function sendMsg(msg: object): boolean {
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(msg));
+    return true;
   }
+  return false;
+}
+
+// ── Feed model ───────────────────────────────────────────────
+function textItem(e: ClipboardEntry): FeedItem {
+  return { kind: "text", id: `t-${e.fromId}-${e.timestamp}`, ...e };
+}
+
+function fileItem(f: FileInfo): FeedItem {
+  return { kind: "file", id: `f-${f.fileId}`, ...f };
+}
+
+function upsertFile(f: FileInfo) {
+  const item = fileItem(f);
+  const idx = feed.findIndex((i) => i.id === item.id);
+  if (idx >= 0) feed[idx] = item;
+  else feed.push(item);
+}
+
+function isMine(item: FeedItem): boolean {
+  return item.kind === "upload" || myPeerIds.has(item.fromId);
+}
+
+function senderKey(item: FeedItem): string {
+  return item.kind === "upload" || isMine(item) ? "me" : item.fromId;
 }
 
 // ── Message Handling ─────────────────────────────────────────
@@ -221,18 +350,21 @@ function handleMessage(msg: ServerMessage) {
   switch (msg.type) {
     case "joined":
       myPeerId = msg.peerId as string;
+      myPeerIds.add(myPeerId);
+      uploadToken = msg.uploadToken as string;
       currentRoom = msg.room as string;
-      if (msg.fileExpiryMinutes)
-        updateExpiryUI(msg.fileExpiryMinutes as number);
+      if (msg.fileExpiryMinutes) updateExpiryUI(msg.fileExpiryMinutes as number);
       if (msg.maxUploadSizeMB) updateMaxUploadUI(msg.maxUploadSizeMB as number);
       isOwner = (msg.isOwner as boolean) ?? false;
       updateSettingsEnabled();
+      // The server replays history and files right after this; drop stale copies so they aren't duplicated
+      feed = feed.filter((i) => i.kind === "upload");
       showMainScreen();
+      scheduleRender();
       break;
 
     case "settings":
-      if (msg.fileExpiryMinutes)
-        updateExpiryUI(msg.fileExpiryMinutes as number);
+      if (msg.fileExpiryMinutes) updateExpiryUI(msg.fileExpiryMinutes as number);
       if (msg.maxUploadSizeMB) updateMaxUploadUI(msg.maxUploadSizeMB as number);
       break;
 
@@ -242,9 +374,7 @@ function handleMessage(msg: ServerMessage) {
       break;
 
     case "peers":
-      renderPeers(
-        msg.peers as { id: string; name: string; isOwner: boolean }[],
-      );
+      renderPeers(msg.peers as Peer[]);
       break;
 
     case "clipboard": {
@@ -254,57 +384,56 @@ function handleMessage(msg: ServerMessage) {
         fromId: msg.fromId as string,
         timestamp: msg.timestamp as number,
       };
-      clipboardEntries.push(entry);
-      renderClipboardFeed();
-      // Auto-copy to clipboard
-      navigator.clipboard?.writeText(entry.text).catch(() => {});
+      feed.push(textItem(entry));
+      scheduleRender();
+      // Auto-copy to clipboard (only succeeds where the browser allows it)
+      if (window.isSecureContext) navigator.clipboard?.writeText(entry.text).catch(() => {});
       break;
     }
 
     case "history": {
       const entries = msg.entries as ClipboardEntry[];
-      clipboardEntries.length = 0;
-      clipboardEntries.push(...entries);
-      renderClipboardFeed();
+      feed = feed.filter((i) => i.kind !== "text").concat(entries.map(textItem));
+      scheduleRender();
       break;
     }
 
-    case "file-notify": {
-      const fi: FileInfo = {
-        fileId: msg.fileId as string,
-        fileName: msg.fileName as string,
-        fileSize: msg.fileSize as number,
-        from: msg.from as string,
-      };
-      sharedFiles.push(fi);
-      renderFileList();
+    case "file-notify":
+      upsertFile(msg as unknown as FileInfo);
+      scheduleRender();
       break;
-    }
 
     case "cleanup": {
       const entries = msg.clipboardEntries as ClipboardEntry[];
-      clipboardEntries.length = 0;
-      clipboardEntries.push(...entries);
-      renderClipboardFeed();
-
-      const cleanFiles = msg.files as FileInfo[];
-      sharedFiles.length = 0;
-      sharedFiles.push(...cleanFiles);
-      renderFileList();
+      const files = msg.files as FileInfo[];
+      feed = [
+        ...feed.filter((i) => i.kind === "upload"),
+        ...entries.map(textItem),
+        ...files.map(fileItem),
+      ];
+      scheduleRender();
       break;
     }
 
     case "error":
       console.error("[ws]", msg.message);
+      if (typeof msg.message === "string") showToast(msg.message);
       break;
   }
 }
 
 // ── UI: Status ───────────────────────────────────────────────
 function updateStatus(connected: boolean) {
+  online = connected;
   headerStatus.innerHTML = connected
     ? '<span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span> Connected'
-    : '<span class="h-1.5 w-1.5 rounded-full bg-red-400"></span> Reconnecting...';
+    : '<span class="h-1.5 w-1.5 animate-pulse rounded-full bg-red-400"></span> Reconnecting…';
+  inputText.placeholder = connected ? "Type, paste, or drop files…" : "Offline — reconnecting…";
+  updateSendEnabled();
+}
+
+function updateSendEnabled() {
+  btnSend.disabled = !online || !inputText.value.trim();
 }
 
 // ── UI: Screens ──────────────────────────────────────────────
@@ -312,19 +441,25 @@ function showJoinScreen() {
   joinScreen.classList.remove("hidden");
   mainScreen.classList.add("hidden");
   mainScreen.classList.remove("flex");
+  history.replaceState(null, "", location.pathname);
 }
 
 function showMainScreen() {
+  const wasHidden = mainScreen.classList.contains("hidden");
   joinScreen.classList.add("hidden");
   mainScreen.classList.remove("hidden");
   mainScreen.classList.add("flex");
 
-  headerRoom.textContent = `Room: ${currentRoom}`;
+  headerRoom.textContent = currentRoom;
+  document.title = `${currentRoom} · Tonglen Clipboard`;
+  history.replaceState(null, "", `?room=${encodeURIComponent(currentRoom)}`);
 
-  // Load QR
-  const url = `${location.origin}?room=${encodeURIComponent(currentRoom)}`;
+  if (!wasHidden) return; // reconnect: QR is already loaded
+  stickToBottom = true;
+  inputText.focus();
+
+  const url = shareLink();
   shareUrl.textContent = url;
-  shareUrlMobile.textContent = url;
 
   fetch(`/api/qr?text=${encodeURIComponent(url)}`)
     .then((r) => r.text())
@@ -350,125 +485,233 @@ function showMainScreen() {
       svgEl.setAttribute("width", "100%");
       svgEl.setAttribute("height", "100%");
 
-      qrContainer.replaceChildren(svgEl.cloneNode(true));
-      qrContainerMobile.replaceChildren(svgEl.cloneNode(true));
+      qrContainer.replaceChildren(svgEl);
     })
     .catch(() => {});
 }
 
 // ── UI: Peers ────────────────────────────────────────────────
-function renderPeers(peers: { id: string; name: string; isOwner: boolean }[]) {
-  headerPeersCount.textContent = `${peers.length} peer${peers.length !== 1 ? "s" : ""}`;
-
-  const html = peers
-    .map(
-      (p) => `
-    <li class="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm ${
-      p.id === myPeerId ? "bg-amber-500/10 text-amber-400" : "text-gray-300"
-    }">
-      <span class="h-2 w-2 shrink-0 rounded-full ${p.id === myPeerId ? "bg-amber-400" : "bg-emerald-400"}"></span>
-      ${escapeHtml(p.name)}${p.id === myPeerId ? " (you)" : ""}${p.isOwner ? ' <span class="text-xs text-amber-500" title="Room owner">★</span>' : ""}
-    </li>`,
-    )
-    .join("");
-
-  peersList.innerHTML = html;
-  peersListMobile.innerHTML = html;
+function initials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  const chars = parts.length > 1 ? [parts[0]!, parts[parts.length - 1]!].map((p) => [...p][0]) : [...(parts[0] ?? "?")].slice(0, 2);
+  return chars.join("").toUpperCase();
 }
 
-// ── UI: Clipboard Feed ───────────────────────────────────────
-function renderClipboardFeed() {
-  if (clipboardEntries.length === 0) {
-    clipboardFeed.innerHTML =
-      '<div class="flex h-full items-center justify-center text-sm text-gray-500">No clipboard entries yet. Share some text!</div>';
+function renderPeers(peers: Peer[]) {
+  headerPeersCount.textContent = `${peers.length} ${peers.length === 1 ? "device" : "devices"}`;
+
+  peersList.innerHTML = peers
+    .map((p) => {
+      const me = p.id === myPeerId;
+      return `
+    <li class="flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm ${me ? "bg-amber-500/10" : ""}">
+      <span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold ${me ? "bg-amber-500 text-gray-950" : "bg-gray-800 text-gray-300"}">${escapeHtml(initials(p.name))}</span>
+      <span class="min-w-0 flex-1 truncate ${me ? "text-amber-300" : "text-gray-200"}">${escapeHtml(p.name)}${me ? ' <span class="text-gray-500">(you)</span>' : ""}</span>
+      ${p.isOwner ? '<span class="shrink-0 rounded-full border border-amber-500/30 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-400">owner</span>' : ""}
+    </li>`;
+    })
+    .join("");
+}
+
+// ── UI: Feed ─────────────────────────────────────────────────
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(renderFeed);
+}
+
+function scrollToBottom() {
+  feedEl.scrollTop = feedEl.scrollHeight;
+}
+
+feedEl.addEventListener("scroll", () => {
+  stickToBottom = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight < 120;
+});
+
+// Images loading and viewport changes (rotation, mobile keyboard) shift the layout; keep the view pinned if it was
+feedEl.addEventListener("load", () => { if (stickToBottom) scrollToBottom(); }, true);
+new ResizeObserver(() => { if (stickToBottom) scrollToBottom(); }).observe(feedEl);
+// Hide previews for files that expired while the page was open
+feedEl.addEventListener("error", (e) => {
+  const img = e.target;
+  if (img instanceof HTMLImageElement) img.closest("[data-preview]")?.remove();
+}, true);
+
+const EMPTY_STATE = `
+  <div class="flex h-full flex-col items-center justify-center px-6 text-center">
+    <div class="flex h-14 w-14 items-center justify-center rounded-2xl border border-gray-800 bg-gray-900 text-amber-400">
+      <i data-lucide="inbox" class="h-6 w-6"></i>
+    </div>
+    <p class="mt-4 text-sm font-medium text-gray-200">Nothing shared yet</p>
+    <p class="mt-1 max-w-xs text-sm text-gray-500">Type a message, paste anything, or drop files anywhere. Everyone in this room gets it instantly.</p>
+  </div>`;
+
+function renderFeed() {
+  renderQueued = false;
+  if (feed.length === 0) {
+    feedEl.innerHTML = EMPTY_STATE;
+    refreshIcons();
     return;
   }
 
-  clipboardFeed.innerHTML = clipboardEntries
-    .map(
-      (e) => `
-    <div class="group relative rounded-lg border border-gray-800 bg-gray-900 p-3">
-      <div class="mb-1 flex items-center justify-between">
-        <span class="text-xs font-medium ${e.fromId === myPeerId ? "text-amber-400" : "text-blue-400"}">${escapeHtml(e.from)}</span>
-        <span class="text-xs text-gray-500">${formatTime(e.timestamp)}</span>
-      </div>
-      <pre class="whitespace-pre-wrap break-all text-sm text-gray-200 font-mono pr-8">${escapeHtml(e.text)}</pre>
-      <button onclick="copyEntry(this)" data-text="${escapeHtml(e.text).replace(/"/g, "&quot;")}"
-        class="absolute bottom-2 right-2 hidden items-center gap-1 rounded bg-gray-800 p-1.5 text-gray-400 hover:text-amber-400 group-hover:inline-flex transition">
-        <i data-lucide="copy" class="h-3.5 w-3.5"></i>
-      </button>
-    </div>`,
-    )
-    .join("");
-
-  clipboardFeed.scrollTop = clipboardFeed.scrollHeight;
-  createIcons({ icons, nameAttr: "data-lucide" });
-}
-
-// Global function for copy button
-(window as any).copyEntry = function (btn: HTMLButtonElement) {
-  const text = btn.dataset.text ?? "";
-  navigator.clipboard?.writeText(text).then(() => {
-    btn.innerHTML = '<i data-lucide="check" class="h-3.5 w-3.5"></i>';
-    btn.classList.add("text-emerald-400");
-    createIcons({ icons, nameAttr: "data-lucide" });
-    setTimeout(() => {
-      btn.innerHTML = '<i data-lucide="copy" class="h-3.5 w-3.5"></i>';
-      btn.classList.remove("text-emerald-400");
-      createIcons({ icons, nameAttr: "data-lucide" });
-    }, 1500);
-  });
-};
-
-// ── UI: File List ────────────────────────────────────────────
-function renderFileList() {
-  if (sharedFiles.length === 0) {
-    fileList.innerHTML =
-      '<div class="flex h-full items-center justify-center text-sm text-gray-500">No files shared yet.</div>';
-    return;
-  }
-
-  fileList.innerHTML = sharedFiles
-    .map(
-      (f) => `
-    <div class="flex items-center justify-between rounded-lg border border-gray-800 bg-gray-900 p-3 mb-2">
-      <div class="min-w-0 flex-1">
-        <p class="truncate text-sm font-medium text-white">${escapeHtml(f.fileName)}</p>
-        <p class="text-xs text-gray-500">${formatSize(f.fileSize)} · from ${escapeHtml(f.from)}</p>
-      </div>
-      <a href="/api/download/${encodeURIComponent(f.fileId)}" download="${escapeHtml(f.fileName)}"
-        class="ml-3 shrink-0 inline-flex items-center gap-1 rounded-lg bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-400 hover:bg-amber-500/20 transition">
-        <i data-lucide="download" class="h-3.5 w-3.5"></i> Download
-      </a>
-    </div>`,
-    )
-    .join("");
-
-  createIcons({ icons, nameAttr: "data-lucide" });
-}
-
-// ── UI: Tabs ─────────────────────────────────────────────────
-document.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach((b) => {
-      b.classList.remove("border-amber-500", "text-amber-400");
-      b.classList.add("border-transparent", "text-gray-400");
-    });
-    btn.classList.add("border-amber-500", "text-amber-400");
-    btn.classList.remove("border-transparent", "text-gray-400");
-
-    const tab = btn.dataset.tab;
-    const tabClipboard = $<HTMLDivElement>("tab-clipboard");
-    const tabFiles = $<HTMLDivElement>("tab-files");
-
-    if (tab === "clipboard") {
-      tabClipboard.classList.remove("hidden");
-      tabFiles.classList.add("hidden");
-    } else {
-      tabClipboard.classList.add("hidden");
-      tabFiles.classList.remove("hidden");
+  const items = [...feed].sort((a, b) => a.timestamp - b.timestamp);
+  let html = "";
+  let prev: FeedItem | undefined;
+  for (const item of items) {
+    const newDay = prev
+      ? dayKey(prev.timestamp) !== dayKey(item.timestamp)
+      : dayKey(item.timestamp) !== dayKey(Date.now());
+    if (newDay) {
+      html += `<div class="my-4 flex items-center gap-3 text-xs text-gray-500"><div class="h-px flex-1 bg-gray-800"></div>${formatDay(item.timestamp)}<div class="h-px flex-1 bg-gray-800"></div></div>`;
     }
-  });
+    const grouped =
+      !newDay &&
+      prev !== undefined &&
+      senderKey(prev) === senderKey(item) &&
+      item.timestamp - prev.timestamp < GROUP_WINDOW_MS;
+    html += renderItem(item, !grouped);
+    prev = item;
+  }
+
+  feedEl.innerHTML = `<div class="mx-auto flex max-w-3xl flex-col pb-2">${html}</div>`;
+  refreshIcons();
+  if (stickToBottom) scrollToBottom();
+}
+
+function renderItem(item: FeedItem, showHeader: boolean): string {
+  const mine = isMine(item);
+  const from = item.kind === "upload" ? myName : item.from;
+  const header = showHeader
+    ? `<div class="mb-1 mt-4 flex items-baseline gap-2 px-1 text-xs">
+        <span class="font-medium ${mine ? "text-amber-400" : "text-sky-400"}">${mine ? "You" : escapeHtml(from)}</span>
+        <span class="text-gray-500">${formatTime(item.timestamp)}</span>
+      </div>`
+    : "";
+
+  let body: string;
+  if (item.kind === "text") body = renderText(item, mine);
+  else if (item.kind === "file") body = renderFile(item, mine);
+  else body = renderUpload(item);
+
+  return `
+    <div class="flex flex-col ${mine ? "items-end" : "items-start"} ${showHeader ? "" : "mt-1.5"}">
+      ${header}
+      <div class="group flex max-w-[92%] items-end gap-1 sm:max-w-[80%] ${mine ? "flex-row-reverse" : ""}">${body}</div>
+    </div>`;
+}
+
+const bubbleClass = (mine: boolean) =>
+  mine
+    ? "rounded-2xl rounded-br-md border border-amber-500/25 bg-amber-500/10"
+    : "rounded-2xl rounded-bl-md border border-gray-800 bg-gray-900";
+
+function renderText(item: Extract<FeedItem, { kind: "text" }>, mine: boolean): string {
+  const long = item.text.split("\n").length > 12 || item.text.length > 800;
+  const expanded = expandedIds.has(item.id);
+  const id = escapeHtml(item.id);
+  return `
+    <div class="min-w-0 px-3 py-2 ${bubbleClass(mine)}" title="${escapeHtml(new Date(item.timestamp).toLocaleString())}">
+      <pre class="whitespace-pre-wrap font-mono text-sm leading-relaxed text-gray-100 [overflow-wrap:anywhere] ${long && !expanded ? "line-clamp-12" : ""}">${linkify(item.text)}</pre>
+      ${long ? `<button type="button" data-action="toggle" data-id="${id}" class="mt-1 text-xs font-medium text-amber-400 hover:underline">${expanded ? "Show less" : `Show more · ${formatSize(new Blob([item.text]).size)}`}</button>` : ""}
+    </div>
+    <button type="button" data-action="copy" data-id="${id}" title="Copy" aria-label="Copy text"
+      class="mb-0.5 shrink-0 rounded-lg p-1.5 text-gray-500 transition hover:bg-gray-800 hover:text-amber-400 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:focus-visible:opacity-100">
+      <i data-lucide="copy" class="h-4 w-4"></i>
+    </button>`;
+}
+
+function fileIcon(mime: string, name: string): string {
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("video/")) return "film";
+  if (mime.startsWith("audio/")) return "music";
+  if (/zip|tar|gzip|7z|rar|compressed/.test(mime) || /\.(zip|tar|gz|tgz|7z|rar)$/i.test(name)) return "file-archive";
+  if (/json|javascript|typescript|xml|x-sh|x-python/.test(mime)) return "file-code";
+  if (mime.startsWith("text/") || mime === "application/pdf") return "file-text";
+  return "file";
+}
+
+function renderFile(item: Extract<FeedItem, { kind: "file" }>, mine: boolean): string {
+  const url = `/api/download/${encodeURIComponent(item.fileId)}`;
+  const name = escapeHtml(item.fileName);
+  const preview = INLINE_IMAGE_TYPES.has(item.mime)
+    ? `<a data-preview href="${url}?inline=1" target="_blank" rel="noopener" class="block border-b border-gray-800 bg-gray-950">
+        <img src="${url}?inline=1" alt="${name}" loading="lazy" class="max-h-72 w-full object-contain" />
+      </a>`
+    : "";
+  return `
+    <div class="w-72 max-w-full min-w-0 overflow-hidden ${bubbleClass(mine)}">
+      ${preview}
+      <div class="flex items-center gap-3 p-2.5">
+        <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gray-800 text-amber-400">
+          <i data-lucide="${fileIcon(item.mime, item.fileName)}" class="h-5 w-5"></i>
+        </div>
+        <div class="min-w-0 flex-1">
+          <p class="truncate text-sm font-medium text-white" title="${name}">${name}</p>
+          <p class="text-xs text-gray-500">${formatSize(item.fileSize)}</p>
+        </div>
+        <a href="${url}" download="${name}" title="Download" aria-label="Download ${name}"
+          class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-amber-500/10 text-amber-400 transition hover:bg-amber-500/20">
+          <i data-lucide="download" class="h-4 w-4"></i>
+        </a>
+      </div>
+    </div>`;
+}
+
+function renderUpload(item: Extract<FeedItem, { kind: "upload" }>): string {
+  const id = escapeHtml(item.id);
+  return `
+    <div data-upload="${id}" class="w-72 max-w-full min-w-0 p-2.5 ${bubbleClass(true)}">
+      <div class="flex items-center gap-3">
+        <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gray-800 text-amber-400">
+          <i data-lucide="loader-circle" class="h-5 w-5 animate-spin"></i>
+        </div>
+        <div class="min-w-0 flex-1">
+          <p class="truncate text-sm font-medium text-white">${escapeHtml(item.fileName)}</p>
+          <p class="text-xs text-gray-400"><span data-pct>${item.pct}%</span> of ${formatSize(item.fileSize)}</p>
+        </div>
+        <button type="button" data-action="cancel" data-id="${id}" title="Cancel upload" aria-label="Cancel upload"
+          class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-gray-400 transition hover:bg-gray-800 hover:text-red-400">
+          <i data-lucide="x" class="h-4 w-4"></i>
+        </button>
+      </div>
+      <div class="mt-2 h-1 w-full rounded-full bg-gray-800">
+        <div data-bar class="h-1 rounded-full bg-amber-500 transition-[width]" style="width:${item.pct}%"></div>
+      </div>
+    </div>`;
+}
+
+feedEl.addEventListener("click", async (e) => {
+  const btn = (e.target as Element).closest<HTMLButtonElement>("[data-action]");
+  if (!btn) return;
+  const id = btn.dataset.id ?? "";
+
+  switch (btn.dataset.action) {
+    case "copy": {
+      const item = feed.find((i) => i.id === id);
+      if (item?.kind !== "text") return;
+      if (await copyText(item.text)) {
+        btn.innerHTML = '<i data-lucide="check" class="h-4 w-4"></i>';
+        btn.classList.add("text-emerald-400", "opacity-100!");
+        refreshIcons();
+        setTimeout(() => {
+          btn.innerHTML = '<i data-lucide="copy" class="h-4 w-4"></i>';
+          btn.classList.remove("text-emerald-400", "opacity-100!");
+          refreshIcons();
+        }, 1500);
+      } else {
+        showToast("Couldn't access the clipboard");
+      }
+      break;
+    }
+    case "toggle":
+      if (expandedIds.has(id)) expandedIds.delete(id);
+      else expandedIds.add(id);
+      scheduleRender();
+      break;
+    case "cancel":
+      uploads.get(id)?.abort();
+      break;
+  }
 });
 
 // ── Actions: Join ────────────────────────────────────────────
@@ -498,255 +741,303 @@ function joinRoom() {
 
   myName = name;
   currentRoom = room;
-  sendMsg({ type: "join", room, name });
+  try {
+    localStorage.setItem(NAME_STORAGE_KEY, name);
+  } catch {}
+  if (!sendMsg({ type: "join", room, name })) {
+    showToast("Not connected to the server yet — retrying…", "info");
+  }
 }
 
 // ── Actions: Leave ───────────────────────────────────────────
 btnLeave.addEventListener("click", () => {
+  for (const xhr of uploads.values()) xhr.abort();
   currentRoom = "";
   isOwner = false;
-  clipboardEntries.length = 0;
-  sharedFiles.length = 0;
-  stopWatching();
-  ws?.close();
+  feed = [];
+  expandedIds.clear();
+  myPeerIds.clear();
+  closeDrawer();
+  renderFeed();
   showJoinScreen();
-  setTimeout(connect, 100);
+  document.title = "Tonglen Clipboard";
+
+  // Reconnect with a fresh socket so the server drops us from the room
+  const old = ws;
+  ws = null;
+  old?.close();
+  connect();
 });
 
 // ── Actions: Send Text ───────────────────────────────────────
+function autoResize() {
+  inputText.style.height = "auto";
+  inputText.style.height = Math.min(inputText.scrollHeight, 192) + "px";
+}
+
+inputText.addEventListener("input", () => {
+  autoResize();
+  updateSendEnabled();
+});
+
 btnSend.addEventListener("click", sendText);
 inputText.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
+  // Don't send while an IME (e.g. Vietnamese/Japanese input) is composing
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
     e.preventDefault();
     sendText();
   }
 });
 
 function sendText() {
-  const text = inputText.value.trim();
-  if (!text) return;
-  sendMsg({ type: "clipboard", text });
-  // Add to local feed immediately
-  clipboardEntries.push({
-    text,
-    from: myName,
-    fromId: myPeerId,
-    timestamp: Date.now(),
-  });
-  renderClipboardFeed();
-  inputText.value = "";
-  lastClipboardText = text;
+  const text = inputText.value;
+  if (!text.trim()) return;
+  if (shareText(text)) {
+    inputText.value = "";
+    autoResize();
+    updateSendEnabled();
+  }
+}
+
+/** Share text with the room. Returns false if it couldn't be sent. */
+function shareText(text: string): boolean {
+  if (!currentRoom) return false;
+
+  if (new Blob([text]).size > MAX_WS_TEXT_BYTES) {
+    showToast("Text is large, so it's being shared as a .txt file", "info");
+    uploadFile(new File([text], `text-${timestampSlug()}.txt`, { type: "text/plain" }));
+    return true;
+  }
+
+  if (!sendMsg({ type: "clipboard", text })) {
+    showToast("You're offline — message not sent");
+    return false;
+  }
+  feed.push(textItem({ text, from: myName, fromId: myPeerId, timestamp: Date.now() }));
+  stickToBottom = true;
+  scheduleRender();
+  return true;
 }
 
 // ── Actions: Copy Link ───────────────────────────────────────
-btnCopyLink.addEventListener("click", () => {
-  const url = `${location.origin}?room=${encodeURIComponent(currentRoom)}`;
-  navigator.clipboard?.writeText(url).then(() => {
-    btnCopyLink.innerHTML =
-      '<i data-lucide="check" class="h-3.5 w-3.5"></i> Copied!';
+async function copyShareLink() {
+  if (await copyText(shareLink())) {
+    showToast("Room link copied", "success");
+    const icon = btnCopyLink.querySelector<HTMLElement>("[data-icon]")!;
+    const label = btnCopyLink.querySelector<HTMLElement>("[data-label]")!;
+    icon.innerHTML = '<i data-lucide="check" class="h-4 w-4 sm:h-3.5 sm:w-3.5"></i>';
+    label.textContent = "Copied!";
     btnCopyLink.classList.add("text-emerald-400", "border-emerald-500");
-    createIcons({ icons, nameAttr: "data-lucide" });
+    refreshIcons();
     setTimeout(() => {
-      btnCopyLink.innerHTML =
-        '<i data-lucide="link" class="h-3.5 w-3.5"></i> Copy Link';
+      icon.innerHTML = '<i data-lucide="link" class="h-4 w-4 sm:h-3.5 sm:w-3.5"></i>';
+      label.textContent = "Copy Link";
       btnCopyLink.classList.remove("text-emerald-400", "border-emerald-500");
-      createIcons({ icons, nameAttr: "data-lucide" });
+      refreshIcons();
     }, 1500);
-  });
-});
-
-// ── Actions: Watch Clipboard ─────────────────────────────────
-let watching = true;
-
-toggleWatch.addEventListener("change", () => {
-  if (toggleWatch.checked) {
-    watching = true;
   } else {
-    watching = false;
+    showToast("Couldn't access the clipboard");
   }
-});
-
-function stopWatching() {
-  watching = false;
-  toggleWatch.checked = false;
 }
 
-// Manual paste button — reads clipboard and shares it
-const btnPaste = $<HTMLButtonElement>("btn-paste");
+btnCopyLink.addEventListener("click", copyShareLink);
+btnRoomCode.addEventListener("click", copyShareLink);
+
+// ── Actions: Paste ───────────────────────────────────────────
+toggleWatch.addEventListener("change", () => {
+  watching = toggleWatch.checked;
+});
+
+function renamePasted(file: File): File {
+  // Browsers name pasted screenshots "image.png"; give them something distinguishable
+  if (file.name && !/^image\.\w+$/i.test(file.name)) return file;
+  const ext = (file.type.split("/")[1] ?? "bin").replace("jpeg", "jpg");
+  return new File([file], `pasted-${timestampSlug()}.${ext}`, { type: file.type });
+}
+
+// Paste button — reads the system clipboard (images or text) and shares it
 btnPaste.addEventListener("click", async () => {
-  // Try the Clipboard API first (requires permission)
-  try {
-    const text = await navigator.clipboard.readText();
-    if (text && text.length > 0) {
-      lastClipboardText = text;
-      sendMsg({ type: "clipboard", text });
-      clipboardEntries.push({
-        text,
-        from: myName,
-        fromId: myPeerId,
-        timestamp: Date.now(),
-      });
-      renderClipboardFeed();
-      return;
-    }
-  } catch {
-    // Permission denied — fall back to execCommand
+  if (!navigator.clipboard || !window.isSecureContext) {
+    showToast("Clipboard access needs HTTPS — press Ctrl+V / ⌘V instead", "info");
+    return;
   }
-  // Fallback: use a temporary textarea + execCommand("paste")
-  const tmp = document.createElement("textarea");
-  tmp.style.position = "fixed";
-  tmp.style.opacity = "0";
-  document.body.appendChild(tmp);
-  tmp.focus();
-  document.execCommand("paste");
-  const text = tmp.value;
-  document.body.removeChild(tmp);
-  if (text && text.length > 0) {
-    lastClipboardText = text;
-    sendMsg({ type: "clipboard", text });
-    clipboardEntries.push({
-      text,
-      from: myName,
-      fromId: myPeerId,
-      timestamp: Date.now(),
-    });
-    renderClipboardFeed();
+  try {
+    if (navigator.clipboard.read) {
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        const imageType = item.types.find((t) => t.startsWith("image/"));
+        if (imageType) {
+          const blob = await item.getType(imageType);
+          uploadFile(renamePasted(new File([blob], "image.png", { type: imageType })));
+          return;
+        }
+      }
+    }
+    const text = await navigator.clipboard.readText();
+    if (text) shareText(text);
+    else showToast("Clipboard is empty", "info");
+  } catch {
+    showToast("Clipboard access was denied — press Ctrl+V / ⌘V instead", "info");
   }
 });
 
-// Listen for paste events anywhere on the page
+// Paste anywhere: files are always uploaded; text is shared when auto-share is on
 document.addEventListener("paste", (e: ClipboardEvent) => {
-  if (!watching) return;
-  // Don't intercept paste when typing in any input or textarea
-  if (
-    document.activeElement instanceof HTMLInputElement ||
-    document.activeElement instanceof HTMLTextAreaElement
-  )
+  if (!currentRoom || mainScreen.classList.contains("hidden")) return;
+
+  const files = Array.from(e.clipboardData?.files ?? []);
+  if (files.length > 0) {
+    e.preventDefault();
+    for (const file of files) uploadFile(renamePasted(file));
     return;
+  }
+
+  if (!watching) return;
+  // Let normal paste happen inside form fields
+  const active = document.activeElement;
+  if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || active instanceof HTMLSelectElement) return;
 
   const text = e.clipboardData?.getData("text/plain");
-  if (text && text !== lastClipboardText && text.length > 0) {
+  if (text) {
     e.preventDefault();
-    lastClipboardText = text;
-    sendMsg({ type: "clipboard", text });
-    clipboardEntries.push({
-      text,
-      from: myName,
-      fromId: myPeerId,
-      timestamp: Date.now(),
-    });
-    renderClipboardFeed();
+    shareText(text);
   }
 });
 
 // ── Actions: File Upload ─────────────────────────────────────
 fileInput.addEventListener("change", () => {
-  const files = fileInput.files;
-  if (files) {
-    for (const file of files) uploadFile(file);
-  }
+  for (const file of fileInput.files ?? []) uploadFile(file);
   fileInput.value = "";
 });
 
-// Drag & drop
-dropZone.addEventListener("dragover", (e) => {
+// Drag & drop anywhere in the room view
+let dragDepth = 0;
+const isFileDrag = (e: DragEvent) => e.dataTransfer?.types.includes("Files") ?? false;
+const inRoom = () => !!currentRoom && !mainScreen.classList.contains("hidden");
+
+function setDropOverlay(visible: boolean) {
+  dropOverlay.classList.toggle("hidden", !visible);
+  dropOverlay.classList.toggle("flex", visible);
+}
+
+window.addEventListener("dragenter", (e) => {
+  if (!inRoom() || !isFileDrag(e)) return;
   e.preventDefault();
-  dropZone.classList.add("border-amber-500", "bg-amber-500/5");
+  dragDepth++;
+  setDropOverlay(true);
 });
 
-dropZone.addEventListener("dragleave", () => {
-  dropZone.classList.remove("border-amber-500", "bg-amber-500/5");
+window.addEventListener("dragover", (e) => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault(); // also stops the browser from opening the file on the join screen
+  if (!inRoom()) return;
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
 });
 
-dropZone.addEventListener("drop", (e) => {
+window.addEventListener("dragleave", (e) => {
+  if (!inRoom() || !isFileDrag(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) setDropOverlay(false);
+});
+
+window.addEventListener("drop", (e) => {
+  if (!isFileDrag(e)) return;
   e.preventDefault();
-  dropZone.classList.remove("border-amber-500", "bg-amber-500/5");
-  const files = e.dataTransfer?.files;
-  if (files) {
-    for (const file of files) uploadFile(file);
-  }
+  if (!inRoom()) return;
+  dragDepth = 0;
+  setDropOverlay(false);
+  for (const file of e.dataTransfer?.files ?? []) uploadFile(file);
 });
 
-async function uploadFile(file: File) {
+function uploadFile(file: File) {
+  if (!currentRoom) return;
   const maxBytes = Number(maxUploadSizeSelect.value) * 1024 * 1024;
   if (file.size > maxBytes) {
-    showAlert(
-      `File "${file.name}" (${formatSize(file.size)}) exceeds the max upload size of ${formatSize(maxBytes)}.`,
-    );
+    showToast(`"${file.name}" (${formatSize(file.size)}) is over the ${formatSize(maxBytes)} limit`);
+    return;
+  }
+  if (file.size === 0) {
+    showToast(`"${file.name}" is empty`);
     return;
   }
 
-  uploadProgress.classList.remove("hidden");
-  uploadName.textContent = file.name;
-  uploadPct.textContent = "0%";
-  uploadBar.style.width = "0%";
+  const id = nextLocalId("u");
+  const item: Extract<FeedItem, { kind: "upload" }> = {
+    kind: "upload",
+    id,
+    fileName: file.name,
+    fileSize: file.size,
+    pct: 0,
+    timestamp: Date.now(),
+  };
+  feed.push(item);
+  stickToBottom = true;
+  scheduleRender();
 
-  try {
-    // Use XMLHttpRequest for progress tracking
-    await new Promise<void>((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", `/api/upload/${encodeURIComponent(currentRoom)}`);
-      xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
-      xhr.setRequestHeader(
-        "X-File-Mime",
-        file.type || "application/octet-stream",
-      );
-      xhr.setRequestHeader("X-Uploader", myName);
+  const removeUpload = () => {
+    uploads.delete(id);
+    feed = feed.filter((i) => i.id !== id);
+  };
 
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) {
-          const pct = Math.round((e.loaded / e.total) * 100);
-          uploadPct.textContent = pct + "%";
-          uploadBar.style.width = pct + "%";
-        }
-      };
+  const xhr = new XMLHttpRequest();
+  uploads.set(id, xhr);
+  xhr.open("POST", `/api/upload/${encodeURIComponent(currentRoom)}`);
+  xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
+  xhr.setRequestHeader("X-File-Mime", file.type || "application/octet-stream");
+  xhr.setRequestHeader("X-Upload-Token", uploadToken);
 
-      xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          const resp = JSON.parse(xhr.responseText);
-          // Notify peers
-          sendMsg({
-            type: "file-notify",
-            fileId: resp.fileId,
-            fileName: resp.fileName,
-            fileSize: resp.fileSize,
-          });
-          // Add to local list
-          sharedFiles.push({
-            fileId: resp.fileId,
-            fileName: resp.fileName,
-            fileSize: resp.fileSize,
-            from: myName,
-          });
-          renderFileList();
-          resolve();
-        } else {
-          reject(new Error(xhr.responseText));
-        }
-      };
+  xhr.upload.onprogress = (e) => {
+    if (!e.lengthComputable) return;
+    item.pct = Math.round((e.loaded / e.total) * 100);
+    // Update in place rather than re-rendering the whole feed
+    const el = feedEl.querySelector(`[data-upload="${id}"]`);
+    el?.querySelector<HTMLElement>("[data-bar]")?.style.setProperty("width", item.pct + "%");
+    const pct = el?.querySelector("[data-pct]");
+    if (pct) pct.textContent = item.pct + "%";
+  };
 
-      xhr.onerror = () => reject(new Error("Upload failed"));
-      xhr.send(file);
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Upload failed";
-    showAlert(message);
-  } finally {
-    setTimeout(() => uploadProgress.classList.add("hidden"), 1000);
-  }
+  xhr.onload = () => {
+    removeUpload();
+    if (xhr.status >= 200 && xhr.status < 300) {
+      const info = JSON.parse(xhr.responseText) as FileInfo;
+      upsertFile(info);
+      sendMsg({ type: "file-notify", fileId: info.fileId, fileName: info.fileName, fileSize: info.fileSize });
+    } else {
+      showToast(xhr.responseText || `Upload of "${file.name}" failed`);
+    }
+    scheduleRender();
+  };
+
+  xhr.onerror = () => {
+    removeUpload();
+    showToast(`Upload of "${file.name}" failed`);
+    scheduleRender();
+  };
+
+  xhr.onabort = () => {
+    removeUpload();
+    scheduleRender();
+  };
+
+  xhr.send(file);
 }
 
 // ── Mobile Drawer ────────────────────────────────────────────
-btnMobilePeers.addEventListener("click", () => {
-  mobileDrawer.classList.remove("hidden");
-});
+function openDrawer() {
+  sidebar.classList.remove("-translate-x-full");
+  drawerBackdrop.classList.remove("hidden");
+}
 
-drawerBackdrop.addEventListener("click", () => {
-  mobileDrawer.classList.add("hidden");
-});
+function closeDrawer() {
+  sidebar.classList.add("-translate-x-full");
+  drawerBackdrop.classList.add("hidden");
+}
 
-btnCloseDrawer.addEventListener("click", () => {
-  mobileDrawer.classList.add("hidden");
+btnMobilePeers.addEventListener("click", openDrawer);
+drawerBackdrop.addEventListener("click", closeDrawer);
+btnCloseDrawer.addEventListener("click", closeDrawer);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeDrawer();
 });
 
 // ── Init ─────────────────────────────────────────────────────
@@ -758,12 +1049,15 @@ function init() {
     inputRoom.value = roomParam;
   }
 
+  try {
+    inputName.value = localStorage.getItem(NAME_STORAGE_KEY) ?? "";
+  } catch {}
+
   // Fetch server info
   fetch("/api/info")
     .then((r) => r.json())
     .then((info: any) => {
-      // serverInfo.textContent = `Port: ${info.port} · ${info.rooms} rooms · ${info.peers} peers`;
-      serverInfo.textContent = `${info.peers} peers`;
+      serverInfo.textContent = `${info.peers} ${info.peers === 1 ? "device" : "devices"} online`;
     })
     .catch(() => {});
 
@@ -772,8 +1066,9 @@ function init() {
     inputRoom.value = generateRoomCode();
   }
 
-  // Focus name input
-  inputName.focus();
+  // Focus the first thing that still needs input
+  if (inputName.value) btnJoin.focus();
+  else inputName.focus();
 
   // Connect WebSocket
   connect();
@@ -798,17 +1093,14 @@ function init() {
   document.head.appendChild(manifestLink);
 
   // Set logo images dynamically
-  const logoJoin = document.getElementById(
-    "logo-join",
-  ) as HTMLImageElement | null;
-  const logoHeader = document.getElementById(
-    "logo-header",
-  ) as HTMLImageElement | null;
+  const logoJoin = document.getElementById("logo-join") as HTMLImageElement | null;
+  const logoHeader = document.getElementById("logo-header") as HTMLImageElement | null;
   if (logoJoin) logoJoin.src = "/favicon.svg";
   if (logoHeader) logoHeader.src = "/favicon.svg";
 
-  // Initialize lucide icons
-  createIcons({ icons, nameAttr: "data-lucide" });
+  renderFeed();
+  updateStatus(false);
+  refreshIcons();
 }
 
 init();

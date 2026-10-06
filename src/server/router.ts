@@ -1,9 +1,20 @@
-import type { FileStore } from "../lib/file-store.ts";
+import { toFileInfo, type FileStore } from "../lib/file-store.ts";
 import type { RoomManager } from "../lib/room.ts";
 import type { FileEntry } from "../lib/types.ts";
 import { getLocalIP } from "./discovery.ts";
 
 const PORT = Number(process.env.PORT) || 7582;
+
+// Image types safe to render inline for previews (no SVG — it can carry script)
+const INLINE_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
 
 // ── Simple in-memory rate limiter ────────────────────────────
 const rateLimitMap = new Map<string, number[]>();
@@ -40,8 +51,17 @@ setInterval(() => {
   }
 }, 60_000);
 
-function getClientIP(req: Request): string {
-  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
+interface IPSource {
+  requestIP(req: Request): { address: string } | null;
+}
+
+function getClientIP(req: Request, server: IPSource): string {
+  // Behind a reverse proxy use the forwarded address; otherwise the socket's own
+  return (
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    server.requestIP(req)?.address ||
+    "unknown"
+  );
 }
 
 function corsHeaders(req: Request): Record<string, string> {
@@ -66,7 +86,7 @@ function corsHeaders(req: Request): Record<string, string> {
 }
 
 export function createRouter(rooms: RoomManager, files: FileStore) {
-  return async function handleRequest(req: Request): Promise<Response | undefined> {
+  return async function handleRequest(req: Request, server: IPSource): Promise<Response | undefined> {
     const url = new URL(req.url);
     const { pathname } = url;
     const cors = corsHeaders(req);
@@ -78,7 +98,7 @@ export function createRouter(rooms: RoomManager, files: FileStore) {
 
     // ── API: Server info ───────────────────────────────────
     if (pathname === "/api/info") {
-      const ip = getClientIP(req);
+      const ip = getClientIP(req, server);
       if (isRateLimited(ip, "info")) {
         return new Response("Too many requests", { status: 429, headers: cors });
       }
@@ -95,12 +115,12 @@ export function createRouter(rooms: RoomManager, files: FileStore) {
 
     // ── API: File upload ───────────────────────────────────
     if (pathname.startsWith("/api/upload/") && req.method === "POST") {
-      const ip = getClientIP(req);
+      const ip = getClientIP(req, server);
       if (isRateLimited(ip, "upload")) {
         return new Response("Too many uploads. Try again later.", { status: 429, headers: cors });
       }
 
-      const roomId = decodeURIComponent(pathname.slice("/api/upload/".length));
+      const roomId = safeDecode(pathname.slice("/api/upload/".length));
       if (!roomId) return new Response("Room ID required", { status: 400, headers: cors });
 
       // Validate room exists
@@ -108,9 +128,14 @@ export function createRouter(rooms: RoomManager, files: FileStore) {
         return new Response("Room not found", { status: 404, headers: cors });
       }
 
+      // Only a peer currently in the room may upload; identity comes from the server, not headers
+      const uploader = rooms.findPeerByToken(roomId, req.headers.get("x-upload-token") ?? "");
+      if (!uploader) {
+        return new Response("You are not a member of this room", { status: 403, headers: cors });
+      }
+
       const fileName = req.headers.get("x-file-name");
       const fileMime = req.headers.get("x-file-mime") || "application/octet-stream";
-      const uploader = (req.headers.get("x-uploader") || "Anonymous").slice(0, 30);
       const fileSize = Number(req.headers.get("content-length") || "0");
 
       if (!fileName || !fileSize || !req.body) {
@@ -122,12 +147,13 @@ export function createRouter(rooms: RoomManager, files: FileStore) {
 
         const entry: FileEntry = {
           id: fileId,
-          name: decodeURIComponent(fileName),
+          name: safeDecode(fileName),
           size: fileSize,
           mime: fileMime,
           filePath: "",
           roomId,
-          uploadedBy: uploader,
+          uploadedBy: uploader.name,
+          uploaderId: uploader.id,
           uploadedAt: Date.now(),
         };
 
@@ -136,7 +162,7 @@ export function createRouter(rooms: RoomManager, files: FileStore) {
           return new Response(result.error, { status: 413, headers: cors });
         }
 
-        return Response.json({ fileId, fileName: entry.name, fileSize }, { headers: cors });
+        return Response.json(toFileInfo(entry), { headers: cors });
       } catch {
         return new Response("Upload failed", { status: 500, headers: cors });
       }
@@ -144,17 +170,20 @@ export function createRouter(rooms: RoomManager, files: FileStore) {
 
     // ── API: File download ─────────────────────────────────
     if (pathname.startsWith("/api/download/")) {
-      const fileId = decodeURIComponent(pathname.slice("/api/download/".length));
+      const fileId = safeDecode(pathname.slice("/api/download/".length));
       const entry = files.get(fileId);
       if (!entry) return new Response("File not found or expired", { status: 404, headers: cors });
 
+      const inline = url.searchParams.has("inline") && INLINE_IMAGE_TYPES.has(entry.mime);
+      const asciiName = entry.name.replace(/[^\x20-\x7e]|["\\]/g, "_");
       return new Response(Bun.file(entry.filePath), {
         headers: {
           ...cors,
-          "Content-Type": "application/octet-stream",
-          "Content-Disposition": `attachment; filename="${encodeURIComponent(entry.name)}"`,
+          "Content-Type": inline ? entry.mime : "application/octet-stream",
+          "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(entry.name)}`,
           "Content-Length": String(entry.size),
           "X-Content-Type-Options": "nosniff",
+          "Content-Security-Policy": "default-src 'none'; sandbox",
         },
       });
     }

@@ -20,6 +20,8 @@ export interface WsData {
   peerId: string;
   peerName: string;
   roomId: string;
+  /** Secret sent only to this socket; authenticates its HTTP uploads */
+  uploadToken: string;
   msgCount: number;
   msgWindowStart: number;
 }
@@ -43,6 +45,7 @@ export interface FileEntry {
   filePath: string;
   roomId: string;
   uploadedBy: string;
+  uploaderId: string;
   uploadedAt: number;
 }
 
@@ -94,12 +97,18 @@ export interface HistoryMessage {
   entries: ClipboardEntry[];
 }
 
-export interface FileBroadcast {
-  type: "file-notify";
+export interface FileInfo {
   fileId: string;
   fileName: string;
   fileSize: number;
+  mime: string;
   from: string;
+  fromId: string;
+  timestamp: number;
+}
+
+export interface FileBroadcast extends FileInfo {
+  type: "file-notify";
 }
 
 export interface ErrorMessage {
@@ -111,6 +120,7 @@ export interface JoinedMessage {
   type: "joined";
   room: string;
   peerId: string;
+  uploadToken: string;
   fileExpiryMinutes: number;
   maxUploadSizeMB: number;
   isOwner: boolean;
@@ -131,7 +141,7 @@ export interface OwnerMessage {
 export interface CleanupBroadcast {
   type: "cleanup";
   clipboardEntries: ClipboardEntry[];
-  files: { fileId: string; fileName: string; fileSize: number; from: string }[];
+  files: FileInfo[];
 }
 
 export type ServerMessage =

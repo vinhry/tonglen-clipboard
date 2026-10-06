@@ -74,6 +74,16 @@ export class RoomManager {
     if (peer) peer.ws.send(JSON.stringify(message));
   }
 
+  /** Find the peer in a room whose socket was issued this upload token. */
+  findPeerByToken(roomId: string, token: string): Peer | undefined {
+    const room = this.rooms.get(roomId);
+    if (!room || !token) return undefined;
+    for (const peer of room.peers.values()) {
+      if (peer.ws.data.uploadToken === token) return peer;
+    }
+    return undefined;
+  }
+
   getRoomIds(): string[] {
     return Array.from(this.rooms.keys());
   }

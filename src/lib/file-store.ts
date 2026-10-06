@@ -1,6 +1,6 @@
 import { mkdirSync, unlinkSync, readdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { FileEntry } from "./types.ts";
+import type { FileEntry, FileInfo } from "./types.ts";
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10GB
 const MIN_UPLOAD_SIZE = 1 * 1024 * 1024; // 1MB
@@ -13,12 +13,27 @@ const MAX_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 const TEMP_DIR = resolve("temp");
 
+/** Public metadata for a stored file, as sent to clients. */
+export function toFileInfo(entry: Omit<FileEntry, "filePath">): FileInfo {
+  return {
+    fileId: entry.id,
+    fileName: entry.name,
+    fileSize: entry.size,
+    mime: entry.mime,
+    from: entry.uploadedBy,
+    fromId: entry.uploaderId,
+    timestamp: entry.uploadedAt,
+  };
+}
+
 export class FileStore {
   private files = new Map<string, FileEntry>();
   private cleanupInterval: ReturnType<typeof setInterval>;
   private roomExpiry = new Map<string, number>();
   private roomMaxUploadSize = new Map<string, number>();
+  // Includes bytes reserved by uploads still in progress
   private currentTotalSize = 0;
+  private pendingPerRoom = new Map<string, number>();
 
   constructor() {
     // Ensure temp directory exists and clear stale files from previous runs
@@ -46,7 +61,7 @@ export class FileStore {
   }
 
   private roomFileCount(roomId: string): number {
-    let count = 0;
+    let count = this.pendingPerRoom.get(roomId) ?? 0;
     for (const entry of this.files.values()) {
       if (entry.roomId === roomId) count++;
     }
@@ -64,16 +79,35 @@ export class FileStore {
     if (this.roomFileCount(entry.roomId) >= MAX_FILES_PER_ROOM) {
       return { ok: false, error: `Room file limit of ${MAX_FILES_PER_ROOM} reached` };
     }
-    const filePath = join(TEMP_DIR, entry.id);
-    const writer = Bun.file(filePath).writer();
-    for await (const chunk of data) {
-      writer.write(chunk);
-    }
-    await writer.end();
-    entry.filePath = filePath;
-    this.files.set(entry.id, entry);
+    // Reserve space and a file slot up front so concurrent uploads can't overshoot the caps
     this.currentTotalSize += entry.size;
-    return { ok: true };
+    this.pendingPerRoom.set(entry.roomId, (this.pendingPerRoom.get(entry.roomId) ?? 0) + 1);
+
+    const filePath = join(TEMP_DIR, entry.id);
+    let writer: ReturnType<ReturnType<typeof Bun.file>["writer"]> | undefined;
+    let completed = false;
+    try {
+      writer = Bun.file(filePath).writer();
+      for await (const chunk of data) {
+        writer.write(chunk);
+      }
+      await writer.end();
+      entry.filePath = filePath;
+      this.files.set(entry.id, entry);
+      completed = true;
+      return { ok: true };
+    } finally {
+      const pending = (this.pendingPerRoom.get(entry.roomId) ?? 1) - 1;
+      if (pending > 0) this.pendingPerRoom.set(entry.roomId, pending);
+      else this.pendingPerRoom.delete(entry.roomId);
+
+      if (!completed) {
+        // Client aborted or the stream failed: release the reservation and drop the partial file
+        this.currentTotalSize = Math.max(0, this.currentTotalSize - entry.size);
+        try { await writer?.end(); } catch {}
+        try { unlinkSync(filePath); } catch {}
+      }
+    }
   }
 
   get(fileId: string): FileEntry | undefined {

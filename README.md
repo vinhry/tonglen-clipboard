@@ -8,16 +8,19 @@
 
 ## Features
 
-### Clipboard Sharing
-- **Real-time sync** — WebSocket-based instant clipboard sharing across all connected peers
-- **Auto-share on paste** — Toggle auto-detection of clipboard paste events; text is shared automatically
-- **Clipboard history** — Up to 100 entries per room with sender name and timestamp
-- **Auto-copy** — Incoming text is automatically copied to your clipboard
+### One Feed for Text & Files
+- **Unified timeline** — Text snippets and files share a single chat-style feed, ordered by time; no tabs to switch
+- **One composer** — Type, paste, attach, or drop files in the same place; `Enter` sends, `Shift+Enter` adds a newline
+- **Drop anywhere** — Drag files onto any part of the room view
+- **Paste anything** — Pasting text shares it (with auto-share on); pasting images or files uploads them
+- **Image previews** — PNG, JPEG, GIF, and WebP files show an inline thumbnail
+- **Per-file upload progress** — Each upload gets its own progress card with a cancel button
+- **Large text fallback** — Text over ~900 KB is shared as a `.txt` file automatically
+- **Auto-copy** — Incoming text is copied to your clipboard where the browser allows it
+- **History** — Up to 100 text entries and 50 files per room, with sender and timestamp
 
-### File Sharing
-- **Drag & drop upload** — Drop files or browse to upload, up to 10 GB per file
-- **Configurable limits** — Room owner can set max upload size (1 MB – 10 GB) and auto-cleanup duration (1 min – 24 hours)
-- **Upload progress** — Real-time progress bar with percentage
+### Files & Limits
+- **Up to 10 GB per file** — Room owner can set max upload size (1 MB – 10 GB) and auto-cleanup duration (1 min – 24 hours)
 - **50 GB server cap** — Global storage limit with per-room cap of 50 files
 
 ### Rooms & Peers

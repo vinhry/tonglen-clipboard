@@ -2,7 +2,7 @@ import type { ServerWebSocket } from "bun";
 import type { ClientMessage, WsData } from "../lib/types.ts";
 import type { RoomManager } from "../lib/room.ts";
 import type { ClipboardHistory } from "../lib/history.ts";
-import type { FileStore } from "../lib/file-store.ts";
+import { toFileInfo, type FileStore } from "../lib/file-store.ts";
 
 const WS_RATE_LIMIT = 60; // max messages per window
 const WS_RATE_WINDOW_MS = 60_000; // 1 minute window
@@ -155,6 +155,7 @@ function handleJoin(
     type: "joined",
     room: sanitizedRoom,
     peerId: ws.data.peerId,
+    uploadToken: ws.data.uploadToken,
     fileExpiryMinutes: Math.round(fileStore.getExpiry(sanitizedRoom) / 60_000),
     maxUploadSizeMB: Math.round(fileStore.getMaxUploadSize(sanitizedRoom) / (1024 * 1024)),
     isOwner: rooms.isOwner(sanitizedRoom, ws.data.peerId),
@@ -166,15 +167,7 @@ function handleJoin(
   // Send file list
   const roomFiles = fileStore.getFilesForRoom(sanitizedRoom);
   for (const f of roomFiles) {
-    ws.send(
-      JSON.stringify({
-        type: "file-notify",
-        fileId: f.id,
-        fileName: f.name,
-        fileSize: f.size,
-        from: f.uploadedBy,
-      }),
-    );
+    ws.send(JSON.stringify({ type: "file-notify", ...toFileInfo(f) }));
   }
 
   // Broadcast updated peer list to everyone in the room
@@ -219,30 +212,20 @@ function handleFileNotify(
   rooms: RoomManager,
   fileStore: FileStore,
 ) {
-  const { peerName, roomId, peerId } = ws.data;
+  const { roomId, peerId } = ws.data;
   if (!roomId) {
     ws.send(JSON.stringify({ type: "error", message: "Not in a room" }));
     return;
   }
 
-  // Verify file actually exists in the store
+  // Verify file actually exists in this room
   const file = fileStore.get(fileId);
-  if (!file) {
+  if (!file || file.roomId !== roomId) {
     ws.send(JSON.stringify({ type: "error", message: "File not found" }));
     return;
   }
 
-  rooms.broadcastToRoom(
-    roomId,
-    {
-      type: "file-notify",
-      fileId,
-      fileName: file.name,
-      fileSize: file.size,
-      from: peerName,
-    },
-    peerId,
-  );
+  rooms.broadcastToRoom(roomId, { type: "file-notify", ...toFileInfo(file) }, peerId);
 }
 
 function handleSettings(
