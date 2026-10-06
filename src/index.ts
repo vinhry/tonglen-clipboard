@@ -1,8 +1,9 @@
 import type { WsData } from "./lib/types.ts";
 import { RoomManager } from "./lib/room.ts";
 import { ClipboardHistory } from "./lib/history.ts";
-import { FileStore, toFileInfo } from "./lib/file-store.ts";
-import { createWebSocketHandlers } from "./server/websocket.ts";
+import { FileStore } from "./lib/file-store.ts";
+import { broadcastCleanup, createWebSocketHandlers } from "./server/websocket.ts";
+import { isAllowedOrigin, TRUST_PROXY } from "./server/proxy.ts";
 import { createRouter } from "./server/router.ts";
 import { startDiscovery, getLocalIP } from "./server/discovery.ts";
 import homepage from "./public/index.html";
@@ -56,6 +57,9 @@ const server = Bun.serve<WsData>({
 
     // Upgrade WebSocket requests
     if (url.pathname === "/ws") {
+      if (!isAllowedOrigin(req)) {
+        return new Response("Origin not allowed", { status: 403 });
+      }
       const peerId = crypto.randomUUID();
       const upgraded = server.upgrade(req, {
         data: {
@@ -104,11 +108,7 @@ setInterval(() => {
 
     // Broadcast updated state only if anything was cleaned
     if (clipRemoved > 0 || filesRemoved > 0) {
-      rooms.broadcastToRoom(roomId, {
-        type: "cleanup",
-        clipboardEntries: history.getHistory(roomId),
-        files: currentFiles.map(toFileInfo),
-      });
+      broadcastCleanup(roomId, rooms, history, files);
     }
   }
 }, 60_000);
@@ -124,5 +124,6 @@ console.log(`
   ╠════════════════════════════════════════════════╣
   ║  Local:   ${pad(`http://localhost:${PORT}`, 36)}║
   ║  Network: ${pad(`http://${localIP}:${PORT}`, 36)}║
+  ║  Proxy:   ${pad(TRUST_PROXY ? "trusting X-Forwarded-* headers" : "direct (X-Forwarded-* ignored)", 36)}║
   ╚════════════════════════════════════════════════╝
 `);

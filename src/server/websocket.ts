@@ -50,6 +50,20 @@ function validateMessage(raw: unknown): ClientMessage | null {
   }
 }
 
+/** Send a room the current clipboard history and file list after entries were removed. */
+export function broadcastCleanup(
+  roomId: string,
+  rooms: RoomManager,
+  history: ClipboardHistory,
+  files: FileStore,
+) {
+  rooms.broadcastToRoom(roomId, {
+    type: "cleanup",
+    clipboardEntries: history.getHistory(roomId),
+    files: files.getFilesForRoom(roomId).map(toFileInfo),
+  });
+}
+
 export function createWebSocketHandlers(
   rooms: RoomManager,
   history: ClipboardHistory,
@@ -82,7 +96,7 @@ export function createWebSocketHandlers(
           handleJoin(ws, msg.room, msg.name, rooms, history, files);
           break;
         case "clipboard":
-          handleClipboard(ws, msg.text, rooms, history);
+          handleClipboard(ws, msg.text, rooms, history, files);
           break;
         case "file-notify":
           handleFileNotify(ws, msg.fileId, msg.fileName, msg.fileSize, rooms, files);
@@ -182,6 +196,7 @@ function handleClipboard(
   text: string,
   rooms: RoomManager,
   clipHistory: ClipboardHistory,
+  fileStore: FileStore,
 ) {
   const { peerId, peerName, roomId } = ws.data;
   if (!roomId) {
@@ -199,9 +214,14 @@ function handleClipboard(
     timestamp: Date.now(),
   };
 
-  clipHistory.addEntry(roomId, entry);
+  const evictedRooms = clipHistory.addEntry(roomId, entry);
 
   rooms.broadcastToRoom(roomId, { type: "clipboard", ...entry }, peerId);
+
+  // Memory caps pushed older entries out; let affected rooms drop them too
+  for (const evictedRoom of evictedRooms) {
+    broadcastCleanup(evictedRoom, rooms, clipHistory, fileStore);
+  }
 }
 
 function handleFileNotify(

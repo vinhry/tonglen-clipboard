@@ -33,13 +33,32 @@ interface Peer {
 type FeedItem =
   | ({ kind: "text"; id: string } & ClipboardEntry)
   | ({ kind: "file"; id: string } & FileInfo)
-  | { kind: "upload"; id: string; fileName: string; fileSize: number; pct: number; timestamp: number };
+  | UploadItem;
+
+interface UploadItem {
+  kind: "upload";
+  id: string;
+  fileName: string;
+  fileSize: number;
+  pct: number;
+  timestamp: number;
+  status: "queued" | "uploading";
+  note?: string;
+}
+
+interface UploadJob {
+  item: UploadItem;
+  file: File;
+  attempts: number;
+}
 
 // ── Constants ────────────────────────────────────────────────
 const GROUP_WINDOW_MS = 2 * 60_000;
 const MAX_WS_TEXT_BYTES = 900_000; // larger text is sent as a .txt file instead
 const INLINE_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 const NAME_STORAGE_KEY = "tonglen:name";
+const MAX_PARALLEL_UPLOADS = 3;
+const MAX_UPLOAD_ATTEMPTS = 3;
 
 // ── State ────────────────────────────────────────────────────
 let ws: WebSocket | null = null;
@@ -55,7 +74,10 @@ let myName = "";
 let isOwner = false;
 let watching = true;
 let feed: FeedItem[] = [];
+// Uploads in flight, waiting for a slot, and waiting out a rate limit
 const uploads = new Map<string, XMLHttpRequest>();
+const uploadQueue: UploadJob[] = [];
+const uploadRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const expandedIds = new Set<string>();
 let localSeq = 0;
 let renderQueued = false;
@@ -657,17 +679,21 @@ function renderFile(item: Extract<FeedItem, { kind: "file" }>, mine: boolean): s
     </div>`;
 }
 
-function renderUpload(item: Extract<FeedItem, { kind: "upload" }>): string {
+function renderUpload(item: UploadItem): string {
   const id = escapeHtml(item.id);
+  const active = item.status === "uploading";
+  const detail = active
+    ? `<span data-pct>${item.pct}%</span> of ${formatSize(item.fileSize)}`
+    : `${escapeHtml(item.note ?? "Waiting…")} · ${formatSize(item.fileSize)}`;
   return `
     <div data-upload="${id}" class="w-72 max-w-full min-w-0 p-2.5 ${bubbleClass(true)}">
       <div class="flex items-center gap-3">
-        <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gray-800 text-amber-400">
-          <i data-lucide="loader-circle" class="h-5 w-5 animate-spin"></i>
+        <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gray-800 ${active ? "text-amber-400" : "text-gray-500"}">
+          <i data-lucide="${active ? "loader-circle" : "clock"}" class="h-5 w-5 ${active ? "animate-spin" : ""}"></i>
         </div>
         <div class="min-w-0 flex-1">
           <p class="truncate text-sm font-medium text-white">${escapeHtml(item.fileName)}</p>
-          <p class="text-xs text-gray-400"><span data-pct>${item.pct}%</span> of ${formatSize(item.fileSize)}</p>
+          <p class="text-xs text-gray-400">${detail}</p>
         </div>
         <button type="button" data-action="cancel" data-id="${id}" title="Cancel upload" aria-label="Cancel upload"
           class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-gray-400 transition hover:bg-gray-800 hover:text-red-400">
@@ -709,7 +735,7 @@ feedEl.addEventListener("click", async (e) => {
       scheduleRender();
       break;
     case "cancel":
-      uploads.get(id)?.abort();
+      cancelUpload(id);
       break;
   }
 });
@@ -751,7 +777,7 @@ function joinRoom() {
 
 // ── Actions: Leave ───────────────────────────────────────────
 btnLeave.addEventListener("click", () => {
-  for (const xhr of uploads.values()) xhr.abort();
+  cancelAllUploads();
   currentRoom = "";
   isOwner = false;
   feed = [];
@@ -961,23 +987,62 @@ function uploadFile(file: File) {
     return;
   }
 
-  const id = nextLocalId("u");
-  const item: Extract<FeedItem, { kind: "upload" }> = {
+  const item: UploadItem = {
     kind: "upload",
-    id,
+    id: nextLocalId("u"),
     fileName: file.name,
     fileSize: file.size,
     pct: 0,
     timestamp: Date.now(),
+    status: "queued",
   };
   feed.push(item);
+  uploadQueue.push({ item, file, attempts: 0 });
   stickToBottom = true;
   scheduleRender();
+  pumpUploads();
+}
 
-  const removeUpload = () => {
-    uploads.delete(id);
-    feed = feed.filter((i) => i.id !== id);
-  };
+/** Start queued uploads while there are free slots. */
+function pumpUploads() {
+  while (uploads.size < MAX_PARALLEL_UPLOADS && uploadQueue.length > 0) {
+    startUpload(uploadQueue.shift()!);
+  }
+}
+
+function removeUploadItem(id: string) {
+  feed = feed.filter((i) => i.id !== id);
+  scheduleRender();
+}
+
+function cancelUpload(id: string) {
+  const xhr = uploads.get(id);
+  if (xhr) {
+    xhr.abort(); // onabort removes the card and frees the slot
+    return;
+  }
+  const queued = uploadQueue.findIndex((j) => j.item.id === id);
+  if (queued >= 0) uploadQueue.splice(queued, 1);
+  clearTimeout(uploadRetryTimers.get(id));
+  uploadRetryTimers.delete(id);
+  removeUploadItem(id);
+}
+
+function cancelAllUploads() {
+  uploadQueue.length = 0;
+  for (const timer of uploadRetryTimers.values()) clearTimeout(timer);
+  uploadRetryTimers.clear();
+  for (const xhr of [...uploads.values()]) xhr.abort();
+}
+
+function startUpload(job: UploadJob) {
+  const { item, file } = job;
+  const id = item.id;
+  job.attempts++;
+  item.status = "uploading";
+  item.pct = 0;
+  item.note = undefined;
+  scheduleRender();
 
   const xhr = new XMLHttpRequest();
   uploads.set(id, xhr);
@@ -996,8 +1061,28 @@ function uploadFile(file: File) {
     if (pct) pct.textContent = item.pct + "%";
   };
 
+  const finish = () => {
+    uploads.delete(id);
+    pumpUploads();
+  };
+
   xhr.onload = () => {
-    removeUpload();
+    if (xhr.status === 429 && job.attempts < MAX_UPLOAD_ATTEMPTS) {
+      // Wait out the server's rate limit, then go back to the front of the queue
+      const wait = Math.min(Number(xhr.getResponseHeader("Retry-After")) || 5, 60);
+      item.status = "queued";
+      item.note = `Rate limited, retrying in ${wait}s`;
+      uploadRetryTimers.set(id, setTimeout(() => {
+        uploadRetryTimers.delete(id);
+        uploadQueue.unshift(job);
+        pumpUploads();
+      }, wait * 1000));
+      scheduleRender();
+      finish();
+      return;
+    }
+
+    removeUploadItem(id);
     if (xhr.status >= 200 && xhr.status < 300) {
       const info = JSON.parse(xhr.responseText) as FileInfo;
       upsertFile(info);
@@ -1005,18 +1090,18 @@ function uploadFile(file: File) {
     } else {
       showToast(xhr.responseText || `Upload of "${file.name}" failed`);
     }
-    scheduleRender();
+    finish();
   };
 
   xhr.onerror = () => {
-    removeUpload();
+    removeUploadItem(id);
     showToast(`Upload of "${file.name}" failed`);
-    scheduleRender();
+    finish();
   };
 
   xhr.onabort = () => {
-    removeUpload();
-    scheduleRender();
+    removeUploadItem(id);
+    finish();
   };
 
   xhr.send(file);

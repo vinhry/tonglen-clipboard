@@ -2,6 +2,7 @@ import { toFileInfo, type FileStore } from "../lib/file-store.ts";
 import type { RoomManager } from "../lib/room.ts";
 import type { FileEntry } from "../lib/types.ts";
 import { getLocalIP } from "./discovery.ts";
+import { getClientIP, type IPSource } from "./proxy.ts";
 
 const PORT = Number(process.env.PORT) || 7582;
 
@@ -19,12 +20,13 @@ function safeDecode(value: string): string {
 // ── Simple in-memory rate limiter ────────────────────────────
 const rateLimitMap = new Map<string, number[]>();
 const RATE_LIMITS: Record<string, { max: number; windowMs: number }> = {
-  upload: { max: 10, windowMs: 60_000 },
+  upload: { max: 60, windowMs: 60_000 },
   info: { max: 30, windowMs: 60_000 },
   default: { max: 60, windowMs: 60_000 },
 };
 
-function isRateLimited(ip: string, bucket: string): boolean {
+/** Returns 0 if the request is allowed, otherwise the seconds to wait before retrying. */
+function rateLimitWait(ip: string, bucket: string): number {
   const key = `${ip}:${bucket}`;
   const limit = RATE_LIMITS[bucket] ?? RATE_LIMITS.default!;
   const now = Date.now();
@@ -36,9 +38,11 @@ function isRateLimited(ip: string, bucket: string): boolean {
   // Prune old entries
   const cutoff = now - limit!.windowMs;
   while (timestamps.length > 0 && timestamps[0]! < cutoff) timestamps.shift();
-  if (timestamps.length >= limit!.max) return true;
+  if (timestamps.length >= limit!.max) {
+    return Math.max(1, Math.ceil((timestamps[0]! + limit!.windowMs - now) / 1000));
+  }
   timestamps.push(now);
-  return false;
+  return 0;
 }
 
 // Periodically clean stale rate-limit entries
@@ -50,19 +54,6 @@ setInterval(() => {
     if (timestamps.length === 0) rateLimitMap.delete(key);
   }
 }, 60_000);
-
-interface IPSource {
-  requestIP(req: Request): { address: string } | null;
-}
-
-function getClientIP(req: Request, server: IPSource): string {
-  // Behind a reverse proxy use the forwarded address; otherwise the socket's own
-  return (
-    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-    server.requestIP(req)?.address ||
-    "unknown"
-  );
-}
 
 function corsHeaders(req: Request): Record<string, string> {
   const origin = req.headers.get("origin") ?? "";
@@ -98,9 +89,9 @@ export function createRouter(rooms: RoomManager, files: FileStore) {
 
     // ── API: Server info ───────────────────────────────────
     if (pathname === "/api/info") {
-      const ip = getClientIP(req, server);
-      if (isRateLimited(ip, "info")) {
-        return new Response("Too many requests", { status: 429, headers: cors });
+      const wait = rateLimitWait(getClientIP(req, server), "info");
+      if (wait) {
+        return new Response("Too many requests", { status: 429, headers: { ...cors, "Retry-After": String(wait) } });
       }
 
       return Response.json(
@@ -115,9 +106,9 @@ export function createRouter(rooms: RoomManager, files: FileStore) {
 
     // ── API: File upload ───────────────────────────────────
     if (pathname.startsWith("/api/upload/") && req.method === "POST") {
-      const ip = getClientIP(req, server);
-      if (isRateLimited(ip, "upload")) {
-        return new Response("Too many uploads. Try again later.", { status: 429, headers: cors });
+      const wait = rateLimitWait(getClientIP(req, server), "upload");
+      if (wait) {
+        return new Response("Too many uploads. Try again later.", { status: 429, headers: { ...cors, "Retry-After": String(wait) } });
       }
 
       const roomId = safeDecode(pathname.slice("/api/upload/".length));
