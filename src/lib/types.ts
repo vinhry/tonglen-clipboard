@@ -20,6 +20,8 @@ export interface WsData {
   peerId: string;
   peerName: string;
   roomId: string;
+  /** Secret sent only to this socket; authenticates its HTTP uploads */
+  uploadToken: string;
   msgCount: number;
   msgWindowStart: number;
 }
@@ -118,6 +120,7 @@ export interface JoinedMessage {
   type: "joined";
   room: string;
   peerId: string;
+  uploadToken: string;
   fileExpiryMinutes: number;
   maxUploadSizeMB: number;
   isOwner: boolean;

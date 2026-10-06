@@ -58,7 +58,14 @@ const server = Bun.serve<WsData>({
     if (url.pathname === "/ws") {
       const peerId = crypto.randomUUID();
       const upgraded = server.upgrade(req, {
-        data: { peerId, peerName: "", roomId: "", msgCount: 0, msgWindowStart: Date.now() } satisfies WsData,
+        data: {
+          peerId,
+          peerName: "",
+          roomId: "",
+          uploadToken: crypto.randomUUID(),
+          msgCount: 0,
+          msgWindowStart: Date.now(),
+        } satisfies WsData,
       });
       if (upgraded) return undefined;
       return new Response("WebSocket upgrade failed", { status: 500 });
@@ -66,7 +73,7 @@ const server = Bun.serve<WsData>({
 
     // API routes
     if (url.pathname.startsWith("/api/")) {
-      const response = await handleApiRequest(req);
+      const response = await handleApiRequest(req, server);
       if (response) return response;
     }
 
@@ -86,7 +93,8 @@ const server = Bun.serve<WsData>({
 const previousFileCounts = new Map<string, number>();
 
 setInterval(() => {
-  const roomIds = rooms.getRoomIds();
+  // Include rooms that have emptied out, so their clipboard history still expires
+  const roomIds = new Set([...rooms.getRoomIds(), ...history.getRoomIds()]);
   for (const roomId of roomIds) {
     const clipRemoved = history.cleanup(roomId);
     const currentFiles = files.getFilesForRoom(roomId);

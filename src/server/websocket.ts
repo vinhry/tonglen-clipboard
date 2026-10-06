@@ -155,6 +155,7 @@ function handleJoin(
     type: "joined",
     room: sanitizedRoom,
     peerId: ws.data.peerId,
+    uploadToken: ws.data.uploadToken,
     fileExpiryMinutes: Math.round(fileStore.getExpiry(sanitizedRoom) / 60_000),
     maxUploadSizeMB: Math.round(fileStore.getMaxUploadSize(sanitizedRoom) / (1024 * 1024)),
     isOwner: rooms.isOwner(sanitizedRoom, ws.data.peerId),

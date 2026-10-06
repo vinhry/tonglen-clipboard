@@ -47,6 +47,7 @@ let online = false;
 let reconnectAttempts = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 let myPeerId = "";
+let uploadToken = "";
 // Peer ids change on every reconnect; remember all of ours so old items still read as "You"
 const myPeerIds = new Set<string>();
 let currentRoom = "";
@@ -350,6 +351,7 @@ function handleMessage(msg: ServerMessage) {
     case "joined":
       myPeerId = msg.peerId as string;
       myPeerIds.add(myPeerId);
+      uploadToken = msg.uploadToken as string;
       currentRoom = msg.room as string;
       if (msg.fileExpiryMinutes) updateExpiryUI(msg.fileExpiryMinutes as number);
       if (msg.maxUploadSizeMB) updateMaxUploadUI(msg.maxUploadSizeMB as number);
@@ -982,8 +984,7 @@ function uploadFile(file: File) {
   xhr.open("POST", `/api/upload/${encodeURIComponent(currentRoom)}`);
   xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
   xhr.setRequestHeader("X-File-Mime", file.type || "application/octet-stream");
-  xhr.setRequestHeader("X-Uploader", encodeURIComponent(myName));
-  xhr.setRequestHeader("X-Peer-Id", myPeerId);
+  xhr.setRequestHeader("X-Upload-Token", uploadToken);
 
   xhr.upload.onprogress = (e) => {
     if (!e.lengthComputable) return;
