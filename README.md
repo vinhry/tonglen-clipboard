@@ -14,6 +14,7 @@
 - **Drop anywhere** — Drag files onto any part of the room view
 - **Paste anything** — Pasting text shares it (with auto-share on); pasting images or files uploads them
 - **Image previews** — PNG, JPEG, GIF, and WebP files show an inline thumbnail
+- **Upload queue** — Up to 3 files upload at once; the rest wait their turn, and rate-limited uploads retry automatically
 - **Per-file upload progress** — Each upload gets its own progress card with a cancel button
 - **Large text fallback** — Text over ~900 KB is shared as a `.txt` file automatically
 - **Auto-copy** — Incoming text is copied to your clipboard where the browser allows it
@@ -33,14 +34,18 @@
 ### Network
 - **LAN auto-discovery** — UDP broadcast beacon finds other instances on the same network
 - **Auto-reconnect** — Exponential backoff reconnection (max 30s)
-- **Rate limiting** — Built-in per-IP rate limits (uploads: 10/min, WebSocket: 60 msg/min)
+- **Rate limiting** — Per-client limits (uploads: 60/min, WebSocket: 60 msg/min); 429 responses include `Retry-After`
+- **Reverse-proxy aware** — With `TRUST_PROXY=1`, client IPs come from `X-Forwarded-For`; otherwise forwarded headers are ignored
+- **Origin check** — WebSocket connections from other websites are refused
+- **Upload tokens** — Only peers connected to a room can upload to it
+- **Memory caps** — Clipboard text is capped at 10 MB per room and 100 MB server-wide; the oldest entries are evicted first
 - **CORS** — Locked to local server origins
 
 ### UI
 - **Responsive design** — Desktop sidebar + mobile drawer for peers and QR code
 - **Dark theme** — TailwindCSS dark theme with amber accents
-- **Tabbed interface** — Clipboard and Files tabs
-- **Toast notifications** — Auto-dismissing error alerts
+- **Single feed** — Text and files in one chat-style timeline
+- **Toast notifications** — Auto-dismissing error, success, and info messages
 
 ### Ephemeral by Design
 - **No database** — All data lives in memory and temp files
@@ -85,13 +90,37 @@ Client (Browser)  ←→  Bun Server (WebSocket + HTTP)  ←→  Client (Browser
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/info` | GET | Server stats (rooms, peers, port) |
-| `/api/upload/:roomId` | POST | Upload file to a room |
-| `/api/download/:fileId` | GET | Download a file |
-| `/api/qr?url=` | GET | Generate QR code (SVG) |
+| `/api/upload/:roomId` | POST | Upload file to a room (requires the `X-Upload-Token` sent to your socket on join) |
+| `/api/download/:fileId` | GET | Download a file (`?inline=1` previews PNG/JPEG/GIF/WebP) |
+| `/api/qr?text=` | GET | Generate QR code (SVG) |
+
+## Configuration
+
+Set via environment variables (see `.env.example`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `7582` | HTTP + WebSocket port |
+| `DISCOVERY_PORT` | `7583` | UDP port for LAN discovery |
+| `TRUST_PROXY` | off | Set to `1` when running behind a reverse proxy, so rate limits use the client address from `X-Forwarded-For` (rightmost entry) and the origin check accepts `X-Forwarded-Host`. Leave off when clients connect directly — otherwise they can spoof their IP. |
+| `ALLOWED_ORIGINS` | — | Extra comma-separated origins allowed to open WebSocket connections, e.g. `https://clip.example.com`. Only needed if your proxy rewrites `Host` without setting `X-Forwarded-Host`. |
 
 ## Deployment
 
-Includes production configs for **PM2** and **Nginx** (with WebSocket proxy, SSL, and 10 GB upload support).
+Includes a production config for **PM2**, which sets `TRUST_PROXY=1` for running behind a reverse proxy such as Nginx.
+
+Your proxy should pass the client address and host through, and allow WebSocket upgrades and large bodies:
+
+```nginx
+proxy_set_header Host $host;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Host $host;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection "upgrade";
+client_max_body_size 10G;
+```
+
+If a CDN sits in front of the proxy, configure the proxy's `real_ip` module so the rightmost `X-Forwarded-For` entry is the real client.
 
 ```bash
 # Build standalone binary

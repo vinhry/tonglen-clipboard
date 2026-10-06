@@ -11,6 +11,8 @@ module.exports = {
       env: {
         PORT: 7582,
         NODE_ENV: "production",
+        // Runs behind a reverse proxy: take client IPs from X-Forwarded-For
+        TRUST_PROXY: 1,
       },
       instances: 1,
       autorestart: true,
